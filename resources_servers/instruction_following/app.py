@@ -71,9 +71,14 @@ class InstructionFollowingResourcesServer(SimpleResourcesServer):
         data is already present. Guard with a local find() first to skip the
         download when the data already exists.
         """
+        import os
+
+        custom_nltk_data_path = os.environ.get("CUSTOM_NLTK_DATA_DIR")
         try:
             import nltk
 
+            if custom_nltk_data_path:
+                nltk.data.path.append(custom_nltk_data_path)
             try:
                 nltk.data.find("tokenizers/punkt_tab")
             except LookupError:
