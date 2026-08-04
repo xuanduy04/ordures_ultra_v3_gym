@@ -121,6 +121,13 @@ class InstructionFollowingResourcesServer(SimpleResourcesServer):
                 # Filter out None values from kwargs
                 filtered_kwargs = {k: v for k, v in kwargs.items() if v is not None}
 
+                # Patch count_increment_word
+                if instruction_id == "count:count_increment_word":
+                    for _k in ("keyword1", "keyword2"):
+                        _v = filtered_kwargs.get(_k)
+                        if isinstance(_v, list):
+                            filtered_kwargs[_k] = _v[0]
+
                 # Build the instruction description with the provided kwargs
                 instruction.build_description(**filtered_kwargs)
 
