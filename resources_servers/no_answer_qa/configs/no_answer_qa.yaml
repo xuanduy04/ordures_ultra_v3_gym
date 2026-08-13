@@ -1,0 +1,56 @@
+# ============================================================================
+# No Answer QA Environment Configuration
+# ============================================================================
+# Trajectory-collector QA environment: Q&A-style samples with NO expected
+# answers. No judge, no reward models, no verifiers. The reward is ALWAYS
+# 0.0 regardless of the assistant output — the environment simply returns
+# the full trajectory to the training side (with 0.0 reward).
+#
+# Train/validation data is reused from general_qa (same HF/gitlab identifiers);
+# leftover answer fields in the rows are ignored by the verifier.
+# ============================================================================
+
+no_answer_qa:
+  resources_servers:
+    no_answer_qa:
+      entrypoint: app.py
+      domain: knowledge
+      verified: false
+      description: Q&A samples with no answers; always returns 0.0 reward (trajectory collector)
+      value: Collect model trajectories on open-ended questions
+no_answer_qa_simple_agent:
+  responses_api_agents:
+    simple_agent:
+      entrypoint: app.py
+      resources_server:
+        type: resources_servers
+        name: no_answer_qa
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      datasets:
+      - name: train
+        type: train
+        jsonl_fpath: resources_servers/no_answer_qa/data/train.jsonl
+        huggingface_identifier:
+          repo_id: nvidia/Nemotron-RL-knowledge-general-qa
+          artifact_fpath: train.jsonl
+        gitlab_identifier:
+          dataset_name: general_qa
+          version: 0.0.1
+          artifact_fpath: train.jsonl
+        license: Apache 2.0
+      - name: validation
+        type: validation
+        jsonl_fpath: resources_servers/no_answer_qa/data/validation.jsonl
+        huggingface_identifier:
+          repo_id: nvidia/Nemotron-RL-knowledge-general-qa
+          artifact_fpath: validation.jsonl
+        gitlab_identifier:
+          dataset_name: general_qa
+          version: 0.0.1
+          artifact_fpath: validation.jsonl
+        license: Apache 2.0
+      - name: example
+        type: example
+        jsonl_fpath: resources_servers/no_answer_qa/data/example.jsonl
