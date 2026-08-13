@@ -6,14 +6,14 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from resources_servers.genrm_compare.comparison_strategies import (
+from resources_servers.genrm_compare_original.comparison_strategies import (
     ComparisonStrategy,
     GenRMStrategy,
     GenRMStrategyConfig,
     extract_generated_text,
     generate_response,
 )
-from resources_servers.genrm_compare.utils import (
+from resources_servers.genrm_compare_original.utils import (
     extract_conversation_history,
     get_prompt_key,
 )

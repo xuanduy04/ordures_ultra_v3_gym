@@ -16,7 +16,7 @@ import pytest
 from pytest import approx
 
 from nemo_gym.openai_utils import NeMoGymEasyInputMessage
-from resources_servers.genrm_compare.utils import (
+from resources_servers.genrm_compare_original.utils import (
     EMPTY_OUTPUT_PLACEHOLDER,
     GenRMOutputParseError,
     aggregate_scores,

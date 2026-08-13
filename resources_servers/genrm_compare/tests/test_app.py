@@ -1,416 +1,207 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-"""Tests for GenRM Compare Resources Server."""
+"""Tests for the outsourced GenRM Compare Resources Server."""
 
-import asyncio
+from typing import Any, Dict
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from pytest import MonkeyPatch, approx
+from openai import BadRequestError
 
-import resources_servers.genrm_compare.app
-from nemo_gym.config_types import ModelServerRef
-from nemo_gym.global_config import ROLLOUT_INDEX_KEY_NAME, TASK_INDEX_KEY_NAME
+from nemo_gym.base_resources_server import BaseVerifyResponse
 from nemo_gym.openai_utils import (
-    NeMoGymEasyInputMessage,
     NeMoGymResponse,
     NeMoGymResponseCreateParamsNonStreaming,
-    NeMoGymResponseOutputMessage,
-    NeMoGymResponseOutputText,
-    NeMoGymResponseReasoningItem,
-    NeMoGymSummary,
 )
+from nemo_gym.server_utils import ServerClient
+
 from resources_servers.genrm_compare.app import (
     GenRMCompareConfig,
     GenRMCompareRequest,
     GenRMCompareResourcesServer,
-    GenRMCompareResponse,
-    GenRMCompareVerifyRequest,
-    _input_to_conversation_history,
 )
-from resources_servers.genrm_compare.utils import get_prompt_key_from_input
+from resources_servers.genrm_compare_original.app import GenRMCompareVerifyRequest
 
 
-class TestGenRMCompareConfig:
-    """Test GenRM compare configuration."""
+def _make_config(**overrides):
+    base = dict(
+        host="localhost",
+        port=8000,
+        entrypoint="app.py",
+        domain="rlhf",
+        name="test",
+        genrm_server_url="0.0.0.0:8000",
+        genrm_model="test-genrm-model",
+        genrm_responses_create_params=NeMoGymResponseCreateParamsNonStreaming(
+            input=[], max_output_tokens=1024
+        ),
+    )
+    base.update(overrides)
+    return GenRMCompareConfig(**base)
 
-    def test_config_defaults(self):
-        """Test configuration with default values."""
-        config = GenRMCompareConfig(
-            # Required fields from BaseServerConfig
+
+class TestConfigRequiredFields:
+    def test_missing_genrm_server_url_raises(self):
+        with pytest.raises(Exception):
+            _make_config(genrm_server_url=None)
+
+    def test_missing_genrm_model_raises(self):
+        with pytest.raises(Exception):
+            _make_config(genrm_model=None)
+
+    def test_missing_genrm_responses_create_params_raises(self):
+        with pytest.raises(Exception):
+            _make_config(genrm_responses_create_params=None)
+
+    def test_valid_config(self):
+        cfg = _make_config()
+        assert cfg.genrm_server_url == "0.0.0.0:8000"
+        assert cfg.genrm_model == "test-genrm-model"
+
+    def test_default_name(self):
+        cfg = GenRMCompareConfig(
             host="localhost",
             port=8000,
-            # Required fields from BaseRunServerConfig
             entrypoint="app.py",
-            # Required fields from BaseResourcesServerConfig
             domain="rlhf",
-            # GenRMCompareConfig fields
-            name="genrm_compare",
-            genrm_model_server=ModelServerRef(type="responses_api_models", name="genrm_model"),
-            genrm_responses_create_params=NeMoGymResponseCreateParamsNonStreaming(input=[], max_output_tokens=1024),
+            genrm_server_url="0.0.0.0:8000",
+            genrm_model="m",
+            genrm_responses_create_params=NeMoGymResponseCreateParamsNonStreaming(input=[]),
         )
+        assert cfg.name == "genrm_compare"
 
-        # Check defaults
-        assert config.comparison_strategy == "circular"
-        assert config.num_judges_per_comparison == 1
-        assert config.use_principle is False
-        assert config.aggregator_method == "simple_tiebreaker"
-        assert config.default_score == 3.0
-        assert config.default_ranking == 3.5
+    def test_no_genrm_model_server_field(self):
+        # This config must not carry the Gym-managed genrm_model_server.
+        cfg = _make_config()
+        assert not hasattr(cfg, "genrm_model_server") or "genrm_model_server" not in cfg.model_fields
 
 
-class TestGenRMCompareRequest:
-    """Test request/response models."""
+class TestInheritedComparison:
+    """Comparison logic is inherited unchanged from the original GenRMCompareResourcesServer."""
 
-    def test_request_creation(self):
-        """Test creating a compare request."""
-        request = GenRMCompareRequest(
-            conversation_history=[{"role": "user", "content": "What is 2+2?"}],
-            response_objs=[
-                {"output": [{"type": "message", "content": [{"type": "output_text", "text": "4"}]}]},
-                {"output": [{"type": "message", "content": [{"type": "output_text", "text": "Four"}]}]},
+    def _make_response_obj(self, output_text: str) -> Dict[str, Any]:
+        return {
+            "id": "resp_123",
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": output_text}],
+                }
             ],
-            principle="Be concise",
+        }
+
+    async def test_compare_single_response_returns_default(self) -> None:
+        """Single response returns default score (no comparison possible)."""
+        cfg = _make_config()
+        server_mock = MagicMock(spec=ServerClient)
+        rs = GenRMCompareResourcesServer.model_construct(config=cfg, server_client=server_mock)
+
+        req = GenRMCompareRequest(
+            conversation_history=[{"role": "user", "content": "Hello"}],
+            response_objs=[self._make_response_obj("Response 1")],
         )
 
-        assert len(request.conversation_history) == 1
-        assert len(request.response_objs) == 2
-        assert request.principle == "Be concise"
+        res = await rs.compare(req)
 
-    def test_response_creation(self):
-        """Test creating a compare response."""
-        response = GenRMCompareResponse(
-            rewards=[3.5, 4.0],
-            comparison_results=[{"response_i": 0, "response_j": 1, "score_1": 3.0, "score_2": 4.0, "ranking": 4.0}],
-            metrics={"mean_individual_score": 3.5},
-        )
+        assert len(res.rewards) == 1
+        assert res.rewards[0] == pytest.approx(3.0)
+        server_mock.post.assert_not_called()
 
-        assert len(response.rewards) == 2
-        assert response.rewards[0] == approx(3.5)
-        assert response.rewards[1] == approx(4.0)
+    async def test_verify_returns_default(self) -> None:
+        """Verify returns default score when num_rollouts_per_prompt <= 1 (inherited cohort gate)."""
+        cfg = _make_config()
+        server_mock = MagicMock(spec=ServerClient)
+        rs = GenRMCompareResourcesServer.model_construct(config=cfg, server_client=server_mock)
 
-
-class TestGenRMCompareResourcesServer:
-    """Test GenRM Compare Resources Server methods."""
-
-    @pytest.fixture
-    def config(self):
-        """Create a test configuration."""
-        return GenRMCompareConfig(
-            host="localhost",
-            port=8000,
-            entrypoint="app.py",
-            domain="rlhf",
-            name="genrm_compare",
-            genrm_model_server=ModelServerRef(type="responses_api_models", name="genrm_model"),
-            genrm_responses_create_params=NeMoGymResponseCreateParamsNonStreaming(input=[], max_output_tokens=1024),
-            comparison_strategy="circular",
-            num_judges_per_comparison=1,
-            debug_logging=False,
-        )
-
-    def test_single_response_returns_default(self, config):
-        """Single response should return default score."""
-        # model_construct bypasses Pydantic validation; server_client is unused for single-response path
-        server = GenRMCompareResourcesServer.model_construct(config=config, server_client=MagicMock())
-
-        # Create request with single response
-        request = GenRMCompareRequest(
-            conversation_history=[{"role": "user", "content": "Hello"}], response_objs=[{"output": []}]
-        )
-
-        response = asyncio.run(server.compare(request))
-
-        assert len(response.rewards) == 1
-        assert response.rewards[0] == config.default_score
-        assert response.comparison_results is None
-        assert response.metrics is None
-
-    def test_verify_cohort_key_prefers_task_index_then_prompt_id(self, config):
-        """Cohort key should use explicit task/prompt identifiers to avoid avoidable collisions."""
-        server = GenRMCompareResourcesServer.model_construct(config=config, server_client=MagicMock())
-        input_messages = [NeMoGymEasyInputMessage(role="user", content="hello", type="message")]
-        prompt_hash = get_prompt_key_from_input(input_messages, "Be concise")
-
-        task_request = GenRMCompareVerifyRequest.model_validate(
-            {
-                "responses_create_params": NeMoGymResponseCreateParamsNonStreaming(input=input_messages),
-                "response": NeMoGymResponse(
-                    id="resp_task",
-                    created_at=0.0,
-                    model="dummy_model",
-                    tools=[],
-                    parallel_tool_calls=True,
-                    tool_choice="auto",
-                    output=[],
-                    object="response",
-                ),
-                "principle": "Be concise",
-                TASK_INDEX_KEY_NAME: 7,
-                ROLLOUT_INDEX_KEY_NAME: 2,
-            }
-        )
-        assert task_request.task_index == 7
-        assert task_request.rollout_index == 2
-        assert server._get_verify_cohort_key(task_request, input_messages, task_request.principle) == (
-            f"task_idx::7::{prompt_hash}"
-        )
-
-        prompt_request = GenRMCompareVerifyRequest.model_validate(
-            {
-                "responses_create_params": NeMoGymResponseCreateParamsNonStreaming(input=input_messages),
-                "response": NeMoGymResponse(
-                    id="resp_prompt",
-                    created_at=0.0,
-                    model="dummy_model",
-                    tools=[],
-                    parallel_tool_calls=True,
-                    tool_choice="auto",
-                    output=[],
-                    object="response",
-                ),
-                "principle": "Be concise",
-                "prompt_id": "prompt-123",
-            }
-        )
-        assert server._get_verify_cohort_key(prompt_request, input_messages, prompt_request.principle) == (
-            f"prompt_id::prompt-123::{prompt_hash}"
-        )
-
-    async def test_run_jit_compare_using_most_recent_response_obj(self, monkeypatch: MonkeyPatch) -> None:
-        config = GenRMCompareConfig(
-            host="localhost",
-            port=8000,
-            entrypoint="app.py",
-            domain="rlhf",
-            name="genrm_compare",
-            genrm_model_server=ModelServerRef(type="responses_api_models", name="genrm_model"),
-            genrm_responses_create_params=NeMoGymResponseCreateParamsNonStreaming(input=[], max_output_tokens=1024),
-            comparison_strategy="circular",
-            num_judges_per_comparison=1,
-            num_rollouts_per_prompt=16,
-            debug_logging=False,
-        )
-        server = GenRMCompareResourcesServer.model_construct(config=config, server_client=MagicMock())
-
-        request = GenRMCompareVerifyRequest(
-            responses_create_params=NeMoGymResponseCreateParamsNonStreaming(
-                input=[
-                    NeMoGymEasyInputMessage(
-                        role="user",
-                        content=[{"type": "input_text", "text": "hello"}],
-                        type="message",
-                    )
-                ],
-            ),
+        req = GenRMCompareVerifyRequest(
+            responses_create_params=NeMoGymResponseCreateParamsNonStreaming(input=[]),
             response=NeMoGymResponse(
-                id="resp_123",
+                id="resp",
                 created_at=0.0,
-                model="dummy_model",
-                tools=[],
-                parallel_tool_calls=True,
-                tool_choice="auto",
-                output=[
-                    NeMoGymResponseReasoningItem(
-                        id="rs_123",
-                        type="reasoning",
-                        summary=[
-                            NeMoGymSummary(
-                                text="I have identified the city as San Francisco based on user input.",
-                                type="summary_text",
-                            )
-                        ],
-                        status="completed",
-                    ),
-                    NeMoGymResponseOutputMessage(
-                        id="msg_123",
-                        role="assistant",
-                        status="completed",
-                        type="message",
-                        content=[
-                            NeMoGymResponseOutputText(
-                                text="hi :) how are you?",
-                                type="output_text",
-                                annotations=[],
-                            )
-                        ],
-                    ),
-                ],
+                model="m",
                 object="response",
+                output=[],
+                parallel_tool_calls=False,
+                tool_choice="none",
+                tools=[],
             ),
         )
 
-        # Patch `aggregate_scores`
-        aggregate_scores_mock = MagicMock(side_effect=resources_servers.genrm_compare.app.aggregate_scores)
-        monkeypatch.setattr(resources_servers.genrm_compare.app, "aggregate_scores", aggregate_scores_mock)
+        res = await rs.verify(req)
+        assert isinstance(res, BaseVerifyResponse)
+        assert res.reward == pytest.approx(3.0)
+        server_mock.post.assert_not_called()
 
-        # Patch `_run_single_comparison`
-        async def run_single_comparison_mock(*args, **kwargs):
-            i, j = kwargs["pair_idx"]
-            # Random deterministic return
-            return (5 * (i + 1 / 16), 5 * (j + 1 / 16), 2 if i % 2 else 5)
+    def test_compare_three_responses_triggers_genrm_calls(self) -> None:
+        """Three responses produce comparison tasks (circular: 3 pairs).
+        We verify this by checking the comparison_pairs generation without
+        actually running compare(), which would require mocking aiohttp.
+        """
+        from resources_servers.genrm_compare_original.utils import generate_comparison_pairs
 
-        monkeypatch.setattr(server, "_run_single_comparison", run_single_comparison_mock)
+        cfg = _make_config()
+        assert cfg.comparison_strategy == "circular"
 
-        golden_result = await server._run_compare(
-            conversation_history=_input_to_conversation_history(request.responses_create_params.input),
-            response_objs=[request.response.model_dump() for _ in range(16)],
-        )
-        golden_rewards = golden_result[0]
+        pairs = generate_comparison_pairs(cfg.comparison_strategy, 3)
+        assert len(pairs) == 3
+        assert pairs == [(0, 1), (1, 2), (2, 0)]
 
-        tasks = []
-        for _ in range(16):
-            tasks.append(server.verify(request))
-
-        results = await asyncio.gather(*tasks)
-
-        expected_metadata = (
-            (
-                0,
-                1,
-                0,
-            ),
-            (
-                1,
-                2,
-                0,
-            ),
-            (
-                2,
-                3,
-                0,
-            ),
-            (
-                3,
-                4,
-                0,
-            ),
-            (
-                4,
-                5,
-                0,
-            ),
-            (
-                5,
-                6,
-                0,
-            ),
-            (
-                6,
-                7,
-                0,
-            ),
-            (
-                7,
-                8,
-                0,
-            ),
-            (
-                8,
-                9,
-                0,
-            ),
-            (
-                9,
-                10,
-                0,
-            ),
-            (
-                10,
-                11,
-                0,
-            ),
-            (
-                11,
-                12,
-                0,
-            ),
-            (
-                12,
-                13,
-                0,
-            ),
-            (
-                13,
-                14,
-                0,
-            ),
-            (
-                14,
-                15,
-                0,
-            ),
-            (
-                15,
-                0,
-                0,
-            ),
-        )
-        # Call 1 since the second call is our tested call
-        actual_metadata = aggregate_scores_mock.call_args_list[1].kwargs["comparison_metadata"]
-        assert expected_metadata == actual_metadata
-
-        expected_rewards = golden_rewards
-        actual_rewards = [r.reward for r in results]
-        assert expected_rewards == actual_rewards
+    def test_default_config_values_match_original(self) -> None:
+        """Outsource config defaults match the original genrm_compare config defaults."""
+        cfg = _make_config()
+        assert cfg.num_rollouts_per_prompt == 1
+        assert cfg.comparison_strategy == "circular"
+        assert cfg.num_judges_per_comparison == 1
+        assert cfg.aggregator_method == "simple_tiebreaker"
+        assert cfg.reasoning_bonus == 0.0
+        assert cfg.answer_bonus == 0.0
+        assert cfg.top_percentile == 0.2
+        assert cfg.group_reasoning_length_penalty_coeff == 0.0
+        assert cfg.group_answer_length_penalty_coeff == 0.0
+        assert cfg.default_score == 3.0
+        assert cfg.default_ranking == 3.5
+        assert cfg.use_principle is False
+        assert cfg.debug_logging is False
+        assert cfg.genrm_parse_retries == 3
+        assert cfg.genrm_parse_retry_sleep_s == 0.2
 
 
-class TestRunSingleComparison:
-    """Tests for GenRMCompareResourcesServer._run_single_comparison."""
+class TestRunSingleComparisonOutsource:
+    """Tests for the overridden _run_single_comparison (chat-completions GenRM transport)."""
 
     def _make_response_obj(self, text):
         return {"output": [{"type": "message", "content": [{"type": "output_text", "text": text}]}]}
 
-    def _make_server(self, use_principle=False):
-        config = GenRMCompareConfig(
-            host="localhost",
-            port=8000,
-            entrypoint="app.py",
-            domain="rlhf",
-            name="genrm_compare",
-            genrm_model_server=ModelServerRef(type="responses_api_models", name="genrm_model"),
-            genrm_responses_create_params=NeMoGymResponseCreateParamsNonStreaming(input=[], max_output_tokens=1024),
-            use_principle=use_principle,
-        )
-        mock_server_client = MagicMock()
-        # Return a well-formed GenRM score response
-        mock_http_response = AsyncMock()
-        mock_http_response.json = AsyncMock(
-            return_value={
-                "output": [
-                    {
-                        "type": "message",
-                        "content": [{"type": "output_text", "text": '{"score_1": 4, "score_2": 2, "ranking": 2}'}],
+    def _make_genrm_response(self, score_1: float, score_2: float, ranking: float) -> Dict[str, Any]:
+        """Helper to create a mock GenRM chat-completions response."""
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": f'{{"score_1": {score_1}, "score_2": {score_2}, "ranking": {ranking}}}'
                     }
-                ]
-            }
-        )
-        mock_server_client.post = AsyncMock(return_value=mock_http_response)
-        server = GenRMCompareResourcesServer.model_construct(config=config, server_client=mock_server_client)
-        return server, mock_server_client
+                }
+            ]
+        }
 
-    def _get_sent_body(self, mock_server_client):
-        call_kwargs = mock_server_client.post.call_args.kwargs
-        return call_kwargs["json"]
+    def _make_server(self, use_principle=False, genrm_parse_retries=None):
+        overrides = {"use_principle": use_principle}
+        if genrm_parse_retries is not None:
+            overrides["genrm_parse_retries"] = genrm_parse_retries
+        cfg = _make_config(**overrides)
+        server = GenRMCompareResourcesServer.model_construct(config=cfg, server_client=MagicMock())
+        return server
 
-    def test_responses_passed_via_metadata_not_input(self):
-        """response_1 and response_2 are sent in metadata, not appended to input."""
-        server, mock_client = self._make_server(use_principle=False)
+    def test_custom_roles_in_payload_and_transport_flags(self, monkeypatch) -> None:
+        """response_1 / response_2 are sent as custom-role chat messages with the
+        env-local parse-retry transport flags."""
+        server = self._make_server(use_principle=False)
         conversation = [{"role": "user", "content": "What is 2+2?"}]
 
-        asyncio.run(
+        post_mock = AsyncMock(return_value=self._make_genrm_response(4, 2, 2))
+        monkeypatch.setattr("resources_servers.genrm_compare.app._post_chat_completions", post_mock)
+
+        import asyncio
+
+        score_1, score_2, ranking = asyncio.run(
             server._run_single_comparison(
                 conversation,
                 self._make_response_obj("4"),
@@ -418,21 +209,31 @@ class TestRunSingleComparison:
             )
         )
 
-        body = self._get_sent_body(mock_client)
-        metadata = body.metadata
-        assert metadata["response_1"] == "4"
-        assert metadata["response_2"] == "Four"
+        assert (score_1, score_2, ranking) == (4.0, 2.0, 2.0)
 
-        # input should contain only the conversation history
-        input_roles = [m.role for m in body.input]
-        assert input_roles == ["user"]
-        assert "response_1" not in input_roles
-        assert "response_2" not in input_roles
+        args = post_mock.await_args.args
+        kwargs = post_mock.await_args.kwargs
+        assert args[0] == "genrm_compare"
+        assert kwargs["max_retries"] == 1
+        assert kwargs["raise_on_context_length_error"] is True
 
-    def test_principle_passed_via_metadata_when_enabled(self):
-        """principle is sent in metadata when use_principle=True."""
-        server, mock_client = self._make_server(use_principle=True)
+        payload = args[2]
+        roles = [m["role"] for m in payload["messages"]]
+        contents = [m["content"] for m in payload["messages"]]
+        assert roles == ["user", "response_1", "response_2"]
+        assert contents == ["What is 2+2?", "4", "Four"]
+        assert payload["model"] == "test-genrm-model"
+        assert payload["stream"] is False
+
+    def test_principle_role_in_payload_when_enabled(self, monkeypatch) -> None:
+        """principle is sent as a custom-role message when use_principle=True."""
+        server = self._make_server(use_principle=True)
         conversation = [{"role": "user", "content": "Explain gravity."}]
+
+        post_mock = AsyncMock(return_value=self._make_genrm_response(3, 3, 3))
+        monkeypatch.setattr("resources_servers.genrm_compare.app._post_chat_completions", post_mock)
+
+        import asyncio
 
         asyncio.run(
             server._run_single_comparison(
@@ -443,13 +244,21 @@ class TestRunSingleComparison:
             )
         )
 
-        body = self._get_sent_body(mock_client)
-        assert body.metadata["principle"] == "Be concise."
+        payload = post_mock.await_args.args[2]
+        roles = [m["role"] for m in payload["messages"]]
+        contents = [m["content"] for m in payload["messages"]]
+        assert roles == ["user", "principle", "response_1", "response_2"]
+        assert contents[1] == "Be concise."
 
-    def test_principle_absent_from_metadata_when_disabled(self):
-        """principle key is absent from metadata when use_principle=False."""
-        server, mock_client = self._make_server(use_principle=False)
+    def test_principle_absent_from_payload_when_disabled(self, monkeypatch) -> None:
+        """principle role is absent when use_principle=False (even if passed to the call)."""
+        server = self._make_server(use_principle=False)
         conversation = [{"role": "user", "content": "Hello"}]
+
+        post_mock = AsyncMock(return_value=self._make_genrm_response(3, 3, 3))
+        monkeypatch.setattr("resources_servers.genrm_compare.app._post_chat_completions", post_mock)
+
+        import asyncio
 
         asyncio.run(
             server._run_single_comparison(
@@ -460,5 +269,48 @@ class TestRunSingleComparison:
             )
         )
 
-        body = self._get_sent_body(mock_client)
-        assert "principle" not in body.metadata
+        payload = post_mock.await_args.args[2]
+        roles = [m["role"] for m in payload["messages"]]
+        assert "principle" not in roles
+
+    def test_bad_request_error_falls_back_to_defaults(self, monkeypatch) -> None:
+        """BadRequestError (non-retryable) falls back to default scores."""
+        server = self._make_server()
+        conversation = [{"role": "user", "content": "Hello"}]
+
+        bad_request = BadRequestError("context too long", response=MagicMock(), body=None)
+        post_mock = AsyncMock(side_effect=bad_request)
+        monkeypatch.setattr("resources_servers.genrm_compare.app._post_chat_completions", post_mock)
+
+        import asyncio
+
+        result = asyncio.run(
+            server._run_single_comparison(
+                conversation,
+                self._make_response_obj("Hi"),
+                self._make_response_obj("Hello there"),
+            )
+        )
+        assert result == (3.0, 3.0, 3.5)
+
+    def test_parse_error_exhausts_retries_falls_back_to_defaults(self, monkeypatch) -> None:
+        """Unparseable GenRM output retries then falls back to defaults."""
+        server = self._make_server(genrm_parse_retries=0)
+        conversation = [{"role": "user", "content": "Hello"}]
+
+        post_mock = AsyncMock(
+            return_value={"choices": [{"message": {"content": "not json at all"}}]}
+        )
+        monkeypatch.setattr("resources_servers.genrm_compare.app._post_chat_completions", post_mock)
+
+        import asyncio
+
+        result = asyncio.run(
+            server._run_single_comparison(
+                conversation,
+                self._make_response_obj("Hi"),
+                self._make_response_obj("Hello there"),
+            )
+        )
+        assert result == (3.0, 3.0, 3.5)
+        post_mock.assert_awaited_once()
