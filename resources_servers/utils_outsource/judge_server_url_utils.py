@@ -248,7 +248,7 @@ async def _post_chat_completions(
     while attempt < max_retries:
         attempt += 1
         try:
-            async with client.post(chat_completions_url, json=payload, headers=headers, timeout=timeout) as response:
+            async with client.post(chat_completions_url, json=payload, headers=headers, timeout=timeout, ssl=False) as response:
                 if response.status in _RETRYABLE_STATUS_CODES:
                     body = await response.text()
                     print(
