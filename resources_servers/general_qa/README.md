@@ -25,10 +25,32 @@ fallback. If neither is found, the raw generated text is used.
 ### LLM judge (optional)
 
 When `should_use_judge=true` **and** the deterministic reward is ≤ 0.5, the
-external LLM judge is invoked. The judge uses an Arena-Hard-style prompt asking
-whether the generated answer is equivalent to the expected answer, using
-`[[A=B]]` / `[[A!=B]]` verdict labels. To eliminate positional bias, both
-answer orderings are evaluated.
+external LLM judge is invoked. The judge uses an Arena-Hard-style **few-shot**
+prompt (instructions plus eight worked equivalence examples in the system
+message) asking whether the generated answer is equivalent to the expected
+answer, using `[[A=B]]` / `[[A!=B]]` verdict labels. The judge's user turn
+always includes the **question** field: the question is only used to search
+for formatting/stylistic requests, never to judge answer correctness. To
+eliminate positional bias, both answer orderings are evaluated.
+
+### Dataset format
+
+Each JSONL row must carry a top-level `question` field alongside
+`expected_answer` (and optionally `should_use_judge`):
+
+```json
+{
+  "agent_ref": {"name": "general_qa_simple_agent"},
+  "responses_create_params": {"input": [{"role": "user", "content": "What is the capital of France?"}]},
+  "question": "What is the capital of France?",
+  "expected_answer": "Paris",
+  "should_use_judge": true
+}
+```
+
+If `question` is missing, non-string, or empty, the server substitutes a
+"question not found" sentinel that instructs the judge to compare the answers
+by content alone.
 
 ## How it differs from `math_with_judge`
 
@@ -74,6 +96,9 @@ Tests cover (no network required):
 - Deterministic verifiers (exact match, math_verify, F1)
 - Answer extraction (boxed, answer-colon, empty)
 - `_verify_answer_deterministically` end-to-end
+- Judge user turn contains the `question` field (mocked chat-completions POST)
+- Missing / non-string / empty `question` falls back to the "question not found" sentinel
+- Verdict parsing (`[[A=B]]` / `[[A!=B]]`), swap pass, and judge skip when `should_use_judge=false`
 
 ## File Structure
 

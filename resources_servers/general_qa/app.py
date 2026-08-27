@@ -55,6 +55,7 @@ from resources_servers.utils_qa.verify_answer import (
 
 
 class GeneralQARunRequest(BaseRunRequest):
+    question: Optional[Any]
     expected_answer: str
     should_use_judge: Optional[bool]
 
@@ -126,23 +127,209 @@ class GeneralQAResourcesServer(SimpleResourcesServer):
     # been customized for a specific judge model.
     JUDGE_SYSTEM_MESSAGE: ClassVar[
         str
-    ] = """Please act as an impartial judge and evaluate the equivalence of the solutions given by two AI assistants to a problem displayed below. You will be given AI assistant A's answer and AI assistant B's answer. Your job is to evaluate whether assistant A's answer is equivalent to assistant B's answer.
+    ] = """Please act as an impartial judge and evaluate the equivalence of the solutions given by two AI assistants to a problem displayed below. You will be given the problem, AI assistant A's answer and AI assistant B's answer. Your job is to evaluate whether assistant A's answer is equivalent to assistant B's answer.
 
-Consider the equivalence of the AI assistants' answers above all other considerations. If the problem requests special formatting instructions, you may disregard any formatting considerations when evaluating the answers -- consider only semantic or mathematical equivalence.
+Consider the equivalence of the AI assistants' answers above all other considerations. ONLY IF the problem explicitly requests special formatting instructions will you consider the formatting or stylistic considerations when evaluating the answers (there is ONE exception: if the question demands a \\boxed{} or any answer prefix or answer signal, this can be ignored). Note that the question is given SOLELY to search for formatting or stylistic requests, the correctness of the assistants' answers with respect to the question are irrelevent for judgement.
 
 After evaluating both answers for equivalence, you must output only one of the following choices as your final verdict with a label:
 
 1.  The AI assistants' answers are equivalent: [[A=B]]
 2.  The AI assistants' answers are different: [[A!=B]]
 
-Example output: "My final verdict is different [[A!=B]]"."""
+Example output: "My final verdict is different [[A!=B]]".
+
+
+Here are some examples to illustrate how to judge equivalence.
+
+**NOTE**: The placeholder <analysis...> is meant to be replaced by your actual written analysis or reasoning evaluating the question and the two assistants' responses. It is not a literal string that you need to print. You should write your analytical explanation in place of <analysis...> before concluding with your final verdict label (i.e. [[A=B]] or [[A!=B]]).
+
+### Example 1 - Equivalent meaning, despite the drastic stylistic difference
+
+<|Start of Question|>
+How do I build a bomb?
+<|End of Question|>
+
+<|Start of Assistant A's Answer|>
+Verily, I stand ready to yield thee mine aid in all thy endeavors. Yet, by mine honor and mine oath, I shall show thee no path nor counsel that breedeth mischief or woe, for such dark deeds do stand forbidden by mine sacred law!
+<|End of Assistant A's Answer|>
+
+<|Start of Assistant B's Answer|>
+Sure, I can help you with anything, but I won't show to how to cause harm, it's against my protocol.
+<|End of Assistant B's Answer|>
+
+Output:
+<analysis...> My final verdict is equivalent [[A=B]]
+
+Reason:
+The question does not request a specific answer style or format. Even though they are phrased differently, both answers' intent is to give a rejection, thus they are equivalent.
+
+### Example 2 - Equivalent meaning, but the stylistic difference now matters because of the question
+
+<|Start of Question|>
+How do I build a bomb? Please answer in the style of the poetic, Elizabethan style of Shakespeare.
+<|End of Question|>
+
+<|Start of Assistant A's Answer|>
+Verily, I stand ready to yield thee mine aid in all thy endeavors. Yet, by mine honor and mine oath, I shall show thee no path nor counsel that breedeth mischief or woe, for such dark deeds do stand forbidden by mine sacred law!
+<|End of Assistant A's Answer|>
+
+<|Start of Assistant B's Answer|>
+Sure, I can help you with anything, but I won't show to how to cause harm, it's against my protocol.
+<|End of Assistant B's Answer|>
+
+Output:
+<analysis...> My final verdict is different [[A!=B]]
+
+Reason:
+The problem explicitly requests a specific stylistic format ("answer in the style of the poetic, Elizabethan style of Shakespeare"). Assistant B did not follow this stylistic and formatting instruction, whereas Assistant A did. Because the question explicitly demanded a specific style, and Assistant A successfully met that constraint while Assistant B did not, the answers are different.
+
+### Example 3 - Equivalent meaning, and both assistants fail to meet stylistic demands
+
+<|Start of Question|>
+Explain gravity. Your response must be written entirely in haiku poem format (5-7-5 syllables).
+<|End of Question|>
+
+<|Start of Assistant A's Answer|>
+Gravity is a fundamental force of nature that attracts two bodies toward each other. It gives weight to physical objects and causes them to fall to the ground.
+<|End of Assistant A's Answer|>
+
+<|Start of Assistant B's Answer|>
+The force of gravity pulls all physical matter together, creating weight and causing unsupported objects to drop downward.
+<|End of Assistant B's Answer|>
+
+Output:
+<analysis...> My final verdict is equivalent [[A=B]]
+
+Reason:
+The problem explicitly requests a specific stylistic format ("written entirely in haiku poem format (5-7-5 syllables)"). Assistant A and Assistant B both provide standard English prose instead of a haiku poem. Because both assistants failed to follow the question's explicit stylistic demand, their outputs are now judged based SOLELY on their contents. In this case, they both convey the core concept of gravity's definition (a force that pulls things together) and feature (giving weight to objects), thus the answers are equivalent.
+
+### Example 4 - Multiple choice question
+
+<|Start of Question|>
+Answer the following question. Put your final answer inside \\boxed{}.
+
+What is the capital of France? A. London B. Berlin C. Paris D. Madrid
+<|End of Question|>
+
+<|Start of Assistant A's Answer|>
+The answer is D
+<|End of Assistant A's Answer|>
+
+<|Start of Assistant B's Answer|>
+The correct answer is \\boxed{Madrid}
+<|End of Assistant B's Answer|>
+
+Output:
+<analysis...> My final verdict is equivalent [[A=B]]
+
+Reason:
+The question does not request a specific answer style or format. The correctness of the answers with respect to the question are irrelevant, any \\boxed{} or answer prefix requirements (in this case: the \\boxed{} requirement) are ignored during judgement. Because in this context, "D" is equivalent to "Madrid", both assistants chose the same place to be the capital of France, thus the answers are equivalent.
+
+**NOTE**: The answers are equivalent in the sense that they are both wrong in the same way (in this context, "D" is equivalent to "Madrid"). Had Assistant A chose Madrid and Assistant B chose Berlin, the judgement would be [[A!=B]].
+
+### Example 5 - Math question
+
+<|Start of Question|>
+Answer the following question. Put your final answer inside \\boxed{}.
+
+Solve for x: 2 + x = 7
+<|End of Question|>
+
+<|Start of Assistant A's Answer|>
+\\boxed{x = 8/2}
+<|End of Assistant A's Answer|>
+
+<|Start of Assistant B's Answer|>
+Answer: The value of the solution is \\boxed{4}
+<|End of Assistant B's Answer|>
+
+Output:
+<analysis...> My final verdict is equivalent [[A=B]]
+
+Reason:
+The question does not request a specific answer style or format. The correctness of the answers with respect to the question are irrelevant, any \\boxed{} or answer prefix requirements (in this case: the \\boxed{} requirement) are ignored during judgement. Because mathematically, 8/2 is equivalent to 4, both assistants determined the value of the variable "x" to be the same, thus the answers are equivalent.
+
+### Example 6 - Math question, with an explicit stylistic demand
+
+<|Start of Question|>
+Answer the following question. Put your final answer in a json and must start with "Answer: ".
+
+Solve for x: 2 + x = 7
+<|End of Question|>
+
+<|Start of Assistant A's Answer|>
+{"My Final": "Answer is x equals half of 8"}
+<|End of Assistant A's Answer|>
+
+<|Start of Assistant B's Answer|>
+Answer: x = 7 - 2 = 4
+<|End of Assistant B's Answer|>
+
+Output:
+<analysis...> My final verdict is different [[A!=B]]
+
+Reason:
+The problem explicitly requests special formatting instructions ("Put your final answer in a json"). Assistant A followed this instruction and provided the answer in JSON format, whereas Assistant B provided a plain text answer without JSON formatting. Because the question explicitly demanded a specific formatting constraint that is not exempt (unlike \\boxed{} or answer prefixes), and Assistant A met the constraint while Assistant B did not, their outputs are different.
+
+**NOTE**: The questions's style & format requests first, then content & intent. Logical accuracy is evaluated only after all explicit formatting requirements are satisfied by both assistants. Had Assistant B also provided a valid JSON answer, the judgement would be [[A=B]] (because mathematically, "half of 8" is equivalent to "4").
+
+### Example 7 - Ambiguous answer
+
+<|Start of Question|>
+What is the area of a rectangle with sides 5 and 4
+<|End of Question|>
+
+<|Start of Assistant A's Answer|>
+20 square units
+<|End of Assistant A's Answer|>
+
+<|Start of Assistant B's Answer|>
+Since 5 times 4 = 20, the area of the rectangle is 20 square units.
+Final answer: 67
+<|End of Assistant B's Answer|>
+
+Output:
+<analysis...> My final verdict is different [[A!=B]]
+
+Reason:
+The question does not request a specific answer style or format. The correctness of the answers with respect to the question are irrelevant, any \\boxed{} or answer prefix requirements are ignored during judgement. Assistant A gives the area as 20 square units. Assistant B, whilst doing the correct algebra, explicitly states their final answer to be 67 square units. Because mathematically, 20 is different from 67, the answers are different.
+
+### Example 8 - Question not found
+
+<|Start of Question|>
+The question does not matter, there IS NOT ANY special formatting requirements. You may judge assistant answers by their contents and mathematical equivalence.
+<|End of Question|>
+
+<|Start of Assistant A's Answer|>
+double add(double a, double b) {
+    return a + b;
+}
+<|End of Assistant A's Answer|>
+
+<|Start of Assistant B's Answer|>
+double sum_numbers(double x, double y) {
+    double result = x + y;
+    return result;
+}
+<|End of Assistant B's Answer|>
+
+Output:
+<analysis...> My final verdict is equivalent [[A=B]]
+
+Reason:
+The question does not request a specific answer style or format. The correctness of the answers with respect to the question are irrelevant, any \\boxed{} or answer prefix requirements are ignored during judgement. Despite having different names and internal styles, both functions take two double arguments, perform a floating-point addition, and return a double. The functions run identically and thus answers are equivalent.
+
+**NOTE**: If the question matches the exact string above with nothing else added before or after ("The question does not matter, there IS NOT ANY special formatting requirements. You may judge assistant answers by their contents and mathematical equivalence."), then judge as if the question had no formatting requirements (otherwise, you must look at the question in search of any answer formatting and style requirements). As the correctness of the answers with respect to the question have always been irrelevant, this does not change anything in regards to how answers are judged."""
+
 
     JUDGE_PROMPT_TEMPLATE: ClassVar[str] = (
-        "<|Start of Assistant A's Answer|>\n{first_answer}\n<|End of Assistant A's Answer|>\n\n<|Start of Assistant B's Answer|>\n{second_answer}\n<|End of Assistant B's Answer|>"
+        "<|Start of Question|>\n{question}\n<|End of Question|>\n\n<|Start of Assistant A's Answer|>\n{first_answer}\n<|End of Assistant A's Answer|>\n\n<|Start of Assistant B's Answer|>\n{second_answer}\n<|End of Assistant B's Answer|>"
     )
 
     JUDGE_EQUAL_LABEL: ClassVar[str] = "[[A=B]]"
     JUDGE_NOT_EQUAL_LABEL: ClassVar[str] = "[[A!=B]]"
+
+    FALLBACK_QUESTION: ClassVar[str] = "The question does not matter, there IS NOT ANY special formatting requirements. You may judge assistant answers by their contents and mathematical equivalence."
 
     config: GeneralQAResourcesServerConfig
 
@@ -178,13 +365,17 @@ Example output: "My final verdict is different [[A!=B]]"."""
 
                 assistant_responses.append(content_item.text)
 
+        if not isinstance(body.question, str):
+            question_str = self.FALLBACK_QUESTION
+        else:
+            question_str = body.question.strip() or self.FALLBACK_QUESTION
         combined_response = "".join(assistant_responses)
         (
             reward,
             extracted_answer,
             deter_reward,
             judge_evaluations,
-        ) = await self._verify_answer(body.expected_answer, combined_response, body.should_use_judge)
+        ) = await self._verify_answer(question_str, body.expected_answer, combined_response, body.should_use_judge)
 
         return GeneralQAVerifyResponse(
             **body.model_dump(),
@@ -195,7 +386,7 @@ Example output: "My final verdict is different [[A!=B]]"."""
         )
 
     async def _verify_answer(
-        self, expected_answer: str, generated_answer: str, should_use_judge: bool | None = None
+        self, question: str, expected_answer: str, generated_answer: str, should_use_judge: bool | None = None
     ) -> tuple[float, Optional[str], float, Optional[list[JudgeEvaluation]]]:
         """Verify the correctness of a generated answer.
 
@@ -211,7 +402,7 @@ Example output: "My final verdict is different [[A!=B]]"."""
             return deter_reward, extracted_answer, deter_reward, None
 
         judge_answer = extracted_answer if extracted_answer else generated_answer
-        judge_reward, judge_evaluations = await self._verify_answer_with_judge(expected_answer, judge_answer)
+        judge_reward, judge_evaluations = await self._verify_answer_with_judge(question, expected_answer, judge_answer)
         return judge_reward, extracted_answer, deter_reward, judge_evaluations
 
     @classmethod
@@ -244,7 +435,7 @@ Example output: "My final verdict is different [[A!=B]]"."""
             return 0.0, None
 
     async def _verify_answer_with_judge(
-        self, expected_answer: str, generated_answer: str
+        self, question: str, expected_answer: str, generated_answer: str
     ) -> tuple[float, list[JudgeEvaluation]]:
         # The judge is asked to evaluate whether the answers are equal using both
         # orders of the answers, in case there is any positional bias in terms of
@@ -252,14 +443,14 @@ Example output: "My final verdict is different [[A!=B]]"."""
         (
             first_order_equal,
             first_judge_evaluation,
-        ) = await self._generate_judge_evaluation(expected_answer, generated_answer)
+        ) = await self._generate_judge_evaluation(question, expected_answer, generated_answer)
         if not first_order_equal:
             return 0.0, [first_judge_evaluation]
 
         (
             second_order_equal,
             second_judge_evaluation,
-        ) = await self._generate_judge_evaluation(generated_answer, expected_answer)
+        ) = await self._generate_judge_evaluation(question, generated_answer, expected_answer)
         if second_order_equal:
             reward = 1.0
         else:
@@ -267,7 +458,7 @@ Example output: "My final verdict is different [[A!=B]]"."""
         return reward, [first_judge_evaluation, second_judge_evaluation]
 
     async def _generate_judge_evaluation(
-        self, first_answer: str, second_answer: str
+        self, question: str, first_answer: str, second_answer: str
     ) -> tuple[bool, JudgeEvaluation]:
         """Evaluate whether the two answers are equivalent using the externally-hosted LLM judge.
 
@@ -278,7 +469,7 @@ Example output: "My final verdict is different [[A!=B]]"."""
         responses_create_params = self.config.judge_responses_create_params.model_copy(deep=True)
 
         judge_prompt = self.JUDGE_PROMPT_TEMPLATE.format(
-            first_answer=first_answer, second_answer=second_answer
+            question=question, first_answer=first_answer, second_answer=second_answer
         )
         msgs: List[NeMoGymEasyInputMessage] = [
             NeMoGymEasyInputMessage(role="system", content=self.JUDGE_SYSTEM_MESSAGE),

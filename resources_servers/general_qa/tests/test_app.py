@@ -1,8 +1,13 @@
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from nemo_gym.openai_utils import NeMoGymResponseCreateParamsNonStreaming
+from nemo_gym.openai_utils import (
+    NeMoGymResponse,
+    NeMoGymResponseCreateParamsNonStreaming,
+    NeMoGymResponseOutputMessage,
+    NeMoGymResponseOutputText,
+)
 from nemo_gym.server_utils import ServerClient
 
 from resources_servers.general_qa.app import (
@@ -216,3 +221,152 @@ class TestVerifyAnswerDeterministically:
         reward, extracted = server._verify_answer_deterministically("", "")
         assert reward == 1.0
         assert extracted == ""
+
+
+class TestVerifyQuestionField:
+    def _make_server(self, config):
+        mock_client = MagicMock(spec=ServerClient)
+        server = GeneralQAResourcesServer.model_construct(config=config, server_client=mock_client)
+        server.model_post_init(None)
+        return server
+
+    def _make_model_response(self, text):
+        item = NeMoGymResponseOutputMessage(
+            id="msg_id",
+            content=[NeMoGymResponseOutputText(annotations=[], text=text, type="output_text")],
+            role="assistant",
+            status="completed",
+            type="message",
+        )
+        return NeMoGymResponse(
+            id="resp_id",
+            created_at=0.0,
+            model="model",
+            object="response",
+            output=[item],
+            parallel_tool_calls=False,
+            tool_choice="none",
+            tools=[],
+        )
+
+    def _make_verify_request(self, question, should_use_judge=True):
+        return GeneralQAVerifyRequest(
+            responses_create_params=NeMoGymResponseCreateParamsNonStreaming(input=[]),
+            response=self._make_model_response("London"),
+            question=question,
+            expected_answer="Paris",
+            should_use_judge=should_use_judge,
+        )
+
+    def _expected_user_turn(self, question, first_answer, second_answer):
+        return GeneralQAResourcesServer.JUDGE_PROMPT_TEMPLATE.format(
+            question=question, first_answer=first_answer, second_answer=second_answer
+        )
+
+    async def test_question_in_judge_user_turn(self):
+        cfg = _make_config(should_use_judge=True)
+        server = self._make_server(cfg)
+        judge_output = "My final verdict is different [[A!=B]]"
+        with patch(
+            "resources_servers.general_qa.app._post_chat_completions",
+            new=AsyncMock(return_value={"choices": [{"message": {"content": judge_output}}]}),
+        ) as post_mock:
+            resp = await server.verify(self._make_verify_request("What is the capital of France?"))
+
+        assert post_mock.await_count == 1
+        assert resp.reward == 0.0
+        assert resp.deter_reward == 0.0
+        assert len(resp.judge_evaluations) == 1
+        evaluation = resp.judge_evaluations[0]
+        msgs = evaluation.responses_create_params.input
+        assert msgs[0].role == "system"
+        assert msgs[0].content == GeneralQAResourcesServer.JUDGE_SYSTEM_MESSAGE
+        assert msgs[1].role == "user"
+        assert msgs[1].content == self._expected_user_turn(
+            "What is the capital of France?", "Paris", "London"
+        )
+
+    async def test_missing_question_uses_fallback(self):
+        cfg = _make_config(should_use_judge=True)
+        server = self._make_server(cfg)
+        judge_output = "My final verdict is different [[A!=B]]"
+        with patch(
+            "resources_servers.general_qa.app._post_chat_completions",
+            new=AsyncMock(return_value={"choices": [{"message": {"content": judge_output}}]}),
+        ):
+            resp = await server.verify(self._make_verify_request(None))
+
+        evaluation = resp.judge_evaluations[0]
+        user_msg = evaluation.responses_create_params.input[1]
+        assert user_msg.content == self._expected_user_turn(
+            GeneralQAResourcesServer.FALLBACK_QUESTION, "Paris", "London"
+        )
+
+    async def test_non_str_question_uses_fallback(self):
+        cfg = _make_config(should_use_judge=True)
+        server = self._make_server(cfg)
+        judge_output = "My final verdict is different [[A!=B]]"
+        with patch(
+            "resources_servers.general_qa.app._post_chat_completions",
+            new=AsyncMock(return_value={"choices": [{"message": {"content": judge_output}}]}),
+        ):
+            resp = await server.verify(self._make_verify_request(42))
+
+        evaluation = resp.judge_evaluations[0]
+        user_msg = evaluation.responses_create_params.input[1]
+        assert user_msg.content == self._expected_user_turn(
+            GeneralQAResourcesServer.FALLBACK_QUESTION, "Paris", "London"
+        )
+
+    async def test_empty_question_uses_fallback(self):
+        cfg = _make_config(should_use_judge=True)
+        server = self._make_server(cfg)
+        judge_output = "My final verdict is different [[A!=B]]"
+        with patch(
+            "resources_servers.general_qa.app._post_chat_completions",
+            new=AsyncMock(return_value={"choices": [{"message": {"content": judge_output}}]}),
+        ):
+            resp = await server.verify(self._make_verify_request(""))
+
+        evaluation = resp.judge_evaluations[0]
+        user_msg = evaluation.responses_create_params.input[1]
+        assert user_msg.content == self._expected_user_turn(
+            GeneralQAResourcesServer.FALLBACK_QUESTION, "Paris", "London"
+        )
+
+    async def test_equal_verdict_requires_swap_pass(self):
+        cfg = _make_config(should_use_judge=True)
+        server = self._make_server(cfg)
+        judge_output = "My final verdict is equivalent [[A=B]]"
+        with patch(
+            "resources_servers.general_qa.app._post_chat_completions",
+            new=AsyncMock(return_value={"choices": [{"message": {"content": judge_output}}]}),
+        ) as post_mock:
+            resp = await server.verify(self._make_verify_request("What is the capital of France?"))
+
+        assert post_mock.await_count == 2
+        assert resp.reward == 1.0
+        assert len(resp.judge_evaluations) == 2
+        first_user_msg = resp.judge_evaluations[0].responses_create_params.input[1]
+        assert first_user_msg.content == self._expected_user_turn(
+            "What is the capital of France?", "Paris", "London"
+        )
+        second_user_msg = resp.judge_evaluations[1].responses_create_params.input[1]
+        assert second_user_msg.content == self._expected_user_turn(
+            "What is the capital of France?", "London", "Paris"
+        )
+
+    async def test_judge_skipped_when_should_use_judge_false(self):
+        cfg = _make_config(should_use_judge=False)
+        server = self._make_server(cfg)
+        with patch(
+            "resources_servers.general_qa.app._post_chat_completions",
+            new=AsyncMock(return_value={"choices": [{"message": {"content": "[[A=B]]"}}]}),
+        ) as post_mock:
+            resp = await server.verify(
+                self._make_verify_request("What is the capital of France?", should_use_judge=False)
+            )
+
+        assert post_mock.await_count == 0
+        assert resp.judge_evaluations is None
+        assert resp.reward == resp.deter_reward
