@@ -25,20 +25,23 @@ import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 from openai import BadRequestError
-from pydantic import Field
+from pydantic import Field, PrivateAttr
 
-from nemo_gym.base_resources_server import BaseResourcesServerConfig
+from nemo_gym.base_resources_server import BaseResourcesServerConfig, BaseVerifyResponse
 from nemo_gym.openai_utils import (
     NeMoGymEasyInputMessage,
     NeMoGymResponseCreateParamsNonStreaming,
 )
-
 from resources_servers.genrm_compare_original.app import (
     GenRMCompareRequest,
     GenRMCompareResponse,
+    GenRMCompareVerifyRequest,
+)
+from resources_servers.genrm_compare_original.app import (
     GenRMCompareResourcesServer as _OriginalGenRMCompareResourcesServer,
 )
 from resources_servers.genrm_compare_original.utils import (
+    RANKING_MIDPOINT,
     GenRMOutputParseError,
     extract_output_text,
     parse_genrm_output,
@@ -50,7 +53,17 @@ from resources_servers.utils_outsource.judge_server_url_utils import (
     _validate_and_setup_judge_endpoint,
 )
 
+
 logger = logging.getLogger(__name__)
+
+# GenRM protocol bounds: score_1/score_2 are on a 1-5 scale and ranking on a
+# 1-6 scale (see parse_genrm_output and the config YAML header comment). These
+# are fixed by the GenRM output format, so the achievable reward range of any
+# config is derived from them plus the aggregator settings below.
+GENRM_SCORE_MIN = 1.0
+GENRM_SCORE_MAX = 5.0
+GENRM_RANKING_MIN = 1.0
+GENRM_RANKING_MAX = 6.0
 
 
 class GenRMCompareConfig(BaseResourcesServerConfig):
@@ -133,6 +146,30 @@ class GenRMCompareConfig(BaseResourcesServerConfig):
     default_score: float = 3.0
     default_ranking: float = 3.5
 
+    # Derived reward bounds: the achievable reward range is fully determined by
+    # the GenRM protocol scale plus this config's aggregator settings, so it is
+    # computed once in model_post_init (not a YAML field, not per-request).
+    _reward_min: float = PrivateAttr()
+    _reward_max: float = PrivateAttr()
+
+    def model_post_init(self, context: Any) -> None:
+        super().model_post_init(context)
+        # Bounds derivation (see aggregate_scores in genrm_compare_original.utils):
+        # - tiebreak swing: when scores tie, score += RANKING_MIDPOINT - ranking,
+        #   with ranking in [1, 6], so each score moves by up to 2.5.
+        # - length bonuses: reasoning_bonus + answer_bonus are added on top of
+        #   the top-performer scores (shortest reasoning/answer).
+        # - group length penalties: coeff * weight with |weight| <= 1, applied
+        #   to every response.
+        tiebreak_swing = max(
+            abs(RANKING_MIDPOINT - GENRM_RANKING_MIN),
+            abs(RANKING_MIDPOINT - GENRM_RANKING_MAX),
+        )
+        length_bonus = self.reasoning_bonus + self.answer_bonus
+        group_penalty = self.group_reasoning_length_penalty_coeff + self.group_answer_length_penalty_coeff
+        self._reward_min = GENRM_SCORE_MIN - tiebreak_swing - group_penalty
+        self._reward_max = GENRM_SCORE_MAX + tiebreak_swing + length_bonus + group_penalty
+
     # Debug logging
     debug_logging: bool = False
 
@@ -147,8 +184,9 @@ class GenRMCompareResourcesServer(_OriginalGenRMCompareResourcesServer):
     Inherits all pairwise comparison / aggregation / parse / cohort-buffering
     logic from
     :class:`resources_servers.genrm_compare_original.app.GenRMCompareResourcesServer`,
-    overriding only the GenRM call path to POST directly to
-    ``{genrm_server_url}/v1/chat/completions``.
+    overriding the GenRM call path to POST directly to
+    ``{genrm_server_url}/v1/chat/completions``, and overriding ``verify()`` /
+    ``compare()`` to map every returned reward to the [0, 1] interval.
     """
 
     config: GenRMCompareConfig
@@ -162,6 +200,36 @@ class GenRMCompareResourcesServer(_OriginalGenRMCompareResourcesServer):
         )
         self._genrm_chat_completions_url = f"{normalized}/v1/chat/completions"
         return super().setup_webserver()
+
+    async def verify(self, body: GenRMCompareVerifyRequest) -> BaseVerifyResponse:
+        """Verify a single rollout (cohort-based), returning a [0, 1]-bounded reward.
+
+        Delegates all buffering / comparison / aggregation logic to the original
+        implementation, then clips the aggregated raw reward to
+        ``[reward_min, reward_max]`` and maps it linearly onto [0, 1].
+        """
+        result = await super().verify(body)
+        return result.model_copy(update={"reward": self._normalize_reward(result.reward)})
+
+    async def compare(self, body: GenRMCompareRequest) -> GenRMCompareResponse:
+        """Run a batch comparison, returning [0, 1]-bounded rewards.
+
+        Delegates all pairwise comparison / aggregation logic to the original
+        implementation, then clips each aggregated raw reward to
+        ``[reward_min, reward_max]`` and maps it linearly onto [0, 1].
+        """
+        result = await super().compare(body)
+        return result.model_copy(update={"rewards": [self._normalize_reward(r) for r in result.rewards]})
+
+    def _normalize_reward(self, reward: float) -> float:
+        """Clip a raw reward to the config-derived [reward_min, reward_max], then map it linearly to [0, 1]."""
+        reward_min = self.config._reward_min
+        reward_max = self.config._reward_max
+        if reward_max <= reward_min:
+            raise ValueError(
+                f"reward_max ({reward_max}) must be greater than reward_min ({reward_min})"
+            )
+        return (min(max(reward, reward_min), reward_max) - reward_min) / (reward_max - reward_min)
 
     async def _run_single_comparison(
         self,

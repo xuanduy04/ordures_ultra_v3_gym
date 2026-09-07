@@ -89,7 +89,7 @@ class TestInheritedComparison:
         }
 
     async def test_compare_single_response_returns_default(self) -> None:
-        """Single response returns default score (no comparison possible)."""
+        """Single response returns normalized default score (no comparison possible)."""
         cfg = _make_config()
         server_mock = MagicMock(spec=ServerClient)
         rs = GenRMCompareResourcesServer.model_construct(config=cfg, server_client=server_mock)
@@ -102,11 +102,12 @@ class TestInheritedComparison:
         res = await rs.compare(req)
 
         assert len(res.rewards) == 1
-        assert res.rewards[0] == pytest.approx(3.0)
+        # default_score 3.0 clipped/mapped onto [reward_min, reward_max] = [1, 5] -> 0.5
+        assert res.rewards[0] == pytest.approx(0.5)
         server_mock.post.assert_not_called()
 
     async def test_verify_returns_default(self) -> None:
-        """Verify returns default score when num_rollouts_per_prompt <= 1 (inherited cohort gate)."""
+        """Verify returns normalized default score when num_rollouts_per_prompt <= 1 (inherited cohort gate)."""
         cfg = _make_config()
         server_mock = MagicMock(spec=ServerClient)
         rs = GenRMCompareResourcesServer.model_construct(config=cfg, server_client=server_mock)
@@ -127,7 +128,8 @@ class TestInheritedComparison:
 
         res = await rs.verify(req)
         assert isinstance(res, BaseVerifyResponse)
-        assert res.reward == pytest.approx(3.0)
+        # default_score 3.0 clipped/mapped onto [reward_min, reward_max] = [1, 5] -> 0.5
+        assert res.reward == pytest.approx(0.5)
         server_mock.post.assert_not_called()
 
     def test_compare_three_responses_triggers_genrm_calls(self) -> None:
@@ -314,3 +316,118 @@ class TestRunSingleComparisonOutsource:
         )
         assert result == (3.0, 3.0, 3.5)
         post_mock.assert_awaited_once()
+
+
+class TestRewardNormalization:
+    """Every reward returned by verify()/compare() is bounded in [0, 1]."""
+
+    def _make_response_obj(self, text):
+        return {"output": [{"type": "message", "content": [{"type": "output_text", "text": text}]}]}
+
+    def _make_genrm_response(self, score_1: float, score_2: float, ranking: float) -> Dict[str, Any]:
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": f'{{"score_1": {score_1}, "score_2": {score_2}, "ranking": {ranking}}}'
+                    }
+                }
+            ]
+        }
+
+    def _make_server(self, **overrides):
+        cfg = _make_config(**overrides)
+        return GenRMCompareResourcesServer.model_construct(config=cfg, server_client=MagicMock())
+
+    def test_bounds_derived_at_init_from_default_config(self) -> None:
+        """Without bonuses/penalties the derived range is [1-2.5, 5+2.5] = [-1.5, 7.5]."""
+        cfg = _make_config()
+        assert cfg._reward_min == pytest.approx(-1.5)
+        assert cfg._reward_max == pytest.approx(7.5)
+
+    def test_bounds_derived_at_init_from_bonus_config(self) -> None:
+        """Bonuses and group penalties widen the derived range (super OPD settings)."""
+        cfg = _make_config(
+            reasoning_bonus=0.5,
+            answer_bonus=0.5,
+            group_reasoning_length_penalty_coeff=0.1,
+            group_answer_length_penalty_coeff=0.2,
+        )
+        # min = 1 - 2.5 - (0.1 + 0.2); max = 5 + 2.5 + (0.5 + 0.5) + (0.1 + 0.2)
+        assert cfg._reward_min == pytest.approx(-1.8)
+        assert cfg._reward_max == pytest.approx(8.8)
+
+    def test_normalize_reward_maps_bounds(self) -> None:
+        """Raw rewards at the derived bounds map to 0.0 and 1.0; midpoint to 0.5."""
+        server = self._make_server()
+        assert server._normalize_reward(-1.5) == pytest.approx(0.0)
+        assert server._normalize_reward(7.5) == pytest.approx(1.0)
+        assert server._normalize_reward(3.0) == pytest.approx(0.5)
+
+    def test_normalize_reward_clips_out_of_range(self) -> None:
+        """Raw rewards outside the derived bounds are clipped before mapping."""
+        server = self._make_server()
+        assert server._normalize_reward(-2.0) == pytest.approx(0.0)
+        assert server._normalize_reward(10.0) == pytest.approx(1.0)
+
+    def test_compare_clips_tiebreak_overflow(self, monkeypatch) -> None:
+        """Tiebreak-adjusted rewards beyond the derived max (7.5) are clipped to 1.0.
+
+        all_pairs with 2 responses is a single comparison (0, 1): identical
+        GenRM scores 5/5 + ranking 1 pushes response 0 to 7.5 and response 1
+        to 2.5 before normalization.
+        """
+        server = self._make_server(comparison_strategy="all_pairs")
+        post_mock = AsyncMock(return_value=self._make_genrm_response(5, 5, 1))
+        monkeypatch.setattr("resources_servers.genrm_compare.app._post_chat_completions", post_mock)
+
+        import asyncio
+
+        req = GenRMCompareRequest(
+            conversation_history=[{"role": "user", "content": "Hello"}],
+            response_objs=[self._make_response_obj("A"), self._make_response_obj("B")],
+        )
+        res = asyncio.run(server.compare(req))
+
+        # raw 7.5 == derived max -> 1.0; raw 2.5 maps to (2.5 + 1.5) / 9
+        assert res.rewards[0] == pytest.approx(1.0)
+        assert res.rewards[1] == pytest.approx((2.5 + 1.5) / 9.0)
+
+    def test_compare_clips_below_min(self, monkeypatch) -> None:
+        """Tiebreak-adjusted rewards below the derived min (-1.5) are clipped to 0.0."""
+        server = self._make_server(comparison_strategy="all_pairs")
+        post_mock = AsyncMock(return_value=self._make_genrm_response(1, 1, 6))
+        monkeypatch.setattr("resources_servers.genrm_compare.app._post_chat_completions", post_mock)
+
+        import asyncio
+
+        req = GenRMCompareRequest(
+            conversation_history=[{"role": "user", "content": "Hello"}],
+            response_objs=[self._make_response_obj("A"), self._make_response_obj("B")],
+        )
+        res = asyncio.run(server.compare(req))
+
+        # raw -1.5 == derived min -> 0.0; raw 3.5 maps to (3.5 + 1.5) / 9
+        assert res.rewards[0] == pytest.approx(0.0)
+        assert res.rewards[1] == pytest.approx((3.5 + 1.5) / 9.0)
+
+    def test_compare_all_rewards_bounded(self, monkeypatch) -> None:
+        """Realistic in-range GenRM scores yield rewards strictly inside (0, 1)."""
+        server = self._make_server(comparison_strategy="all_pairs")
+        post_mock = AsyncMock(return_value=self._make_genrm_response(4, 3, 2))
+        monkeypatch.setattr("resources_servers.genrm_compare.app._post_chat_completions", post_mock)
+
+        import asyncio
+
+        req = GenRMCompareRequest(
+            conversation_history=[{"role": "user", "content": "Hello"}],
+            response_objs=[self._make_response_obj("A"), self._make_response_obj("B")],
+        )
+        res = asyncio.run(server.compare(req))
+
+        assert len(res.rewards) == 2
+        for reward in res.rewards:
+            assert 0.0 <= reward <= 1.0
+        # raw scores 4 and 3 (no tiebreak) -> (4 + 1.5) / 9 and (3 + 1.5) / 9
+        assert res.rewards[0] == pytest.approx((4.0 + 1.5) / 9.0)
+        assert res.rewards[1] == pytest.approx((3.0 + 1.5) / 9.0)
