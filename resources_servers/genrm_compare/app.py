@@ -337,7 +337,7 @@ class GenRMCompareResourcesServer(_OriginalGenRMCompareResourcesServer):
             return cfg.default_score, cfg.default_score, cfg.default_ranking
 
         except Exception as e:
-            logger.error(f"[GenRM] Error in comparison for pair {pair_idx}: {e}")
+            logger.error(f"[GenRM] Error in comparison for pair {pair_idx}: {type(e).__name__}: {e!r}")
             return cfg.default_score, cfg.default_score, cfg.default_ranking
 
 

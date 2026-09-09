@@ -48,7 +48,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 _RETRYABLE_STATUS_CODES: set[int] = {429, 500, 502, 503, 504}
 _MAX_RETRIES: int = 3
 _WAIT_SECONDS_BEFORE_RETRY: float = 5
-_REQUEST_TIMEOUT_SECONDS: int = 600
+_REQUEST_TIMEOUT_SECONDS: int = 2767
 _MODELS_FETCH_MAX_ATTEMPTS: int = 6
 _MODELS_FETCH_TIMEOUT: int = 10
 
@@ -272,7 +272,8 @@ async def _post_chat_completions(
                 return {}
             print(
                 f"[WARNING] {env_name} at {attempt=}/{max_retries}: judge request failed "
-                f"with error ({exc}); retrying in {_WAIT_SECONDS_BEFORE_RETRY} second(s)..."
+                f"with error {type(exc).__name__}: {exc!r}; "
+                f"retrying in {_WAIT_SECONDS_BEFORE_RETRY} second(s)..."
             )
             await asyncio.sleep(_WAIT_SECONDS_BEFORE_RETRY + random.uniform(0, 1))
     print(
