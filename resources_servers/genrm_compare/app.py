@@ -315,24 +315,22 @@ class GenRMCompareResourcesServer(_OriginalGenRMCompareResourcesServer):
                         raise_on_fail=True,
                     )
                     return score_1, score_2, ranking
-
-                except GenRMOutputParseError:
+                
+                except (GenRMOutputParseError, TimeoutError) as e:
                     if attempt_idx < max_attempts - 1:
                         await asyncio.sleep(float(cfg.genrm_parse_retry_sleep_s))
                         continue
-
                     logger.warning(
-                        f"[GenRM] Parse failed for pair {pair_idx} after {max_attempts} attempts; "
-                        f"falling back to defaults."
+                        f"[GenRM] {'TimeoutError' if isinstance(e, TimeoutError) else 'Parse failed'} "
+                        f"for pair {pair_idx} after {max_attempts} attempts; falling back to defaults."
                     )
-                    return cfg.default_score, cfg.default_score, cfg.default_ranking
 
                 except BadRequestError as e:
                     logger.warning(
-                        f"[GenRM] BadRequestError for pair {pair_idx}; falling back to defaults. "
+                        f"[GenRM] BadRequestError for pair {pair_idx}; falling immediately back to defaults. "
                         f"Error: {e}"
                     )
-                    return cfg.default_score, cfg.default_score, cfg.default_ranking
+                    break
 
             return cfg.default_score, cfg.default_score, cfg.default_ranking
 

@@ -47,11 +47,16 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # ---------------------------------------------------------------------------
 _RETRYABLE_STATUS_CODES: set[int] = {429, 500, 502, 503, 504}
 _MAX_RETRIES: int = 3
-_WAIT_SECONDS_BEFORE_RETRY: float = 5
 _REQUEST_TIMEOUT_SECONDS: int = 2767
 _MODELS_FETCH_MAX_ATTEMPTS: int = 6
 _MODELS_FETCH_TIMEOUT: int = 10
 
+def _get_retry_delay(attempt: int) -> float:
+    _RETRY_DELAY_BASE = 2.0
+    _MAX_RETRY_DELAY = 26.7
+
+    backoff = min(_MAX_RETRY_DELAY, _RETRY_DELAY_BASE * (2 ** (attempt - 1)))
+    return random.uniform(0.0, backoff)
 
 # ---------------------------------------------------------------------------
 # URL normalisation
@@ -250,13 +255,14 @@ async def _post_chat_completions(
         try:
             async with client.post(chat_completions_url, json=payload, headers=headers, timeout=timeout, ssl=False) as response:
                 if response.status in _RETRYABLE_STATUS_CODES:
+                    retry_delay = _get_retry_delay(attempt)
                     body = await response.text()
                     print(
                         f"[WARNING] {env_name} at {attempt=}/{max_retries}: judge request "
                         f"returned status code ({response.status}) with body ({body[:300]}); "
-                        f"retrying in {_WAIT_SECONDS_BEFORE_RETRY} second(s)..."
+                        f"retrying in {retry_delay}s..."
                     )
-                    await asyncio.sleep(_WAIT_SECONDS_BEFORE_RETRY + random.uniform(0, 1))
+                    await asyncio.sleep(retry_delay)
                     continue
                 if response.status >= 400:
                     body = await response.text()
@@ -264,18 +270,37 @@ async def _post_chat_completions(
                         f"judge request failed with non-retryable status {response.status}: {body[:500]}"
                     )
                 return await response.json()
+
+        except (asyncio.TimeoutError, TimeoutError) as exc:
+            retry_delay = _get_retry_delay(attempt)
+            print(
+                f"[WARNING] {env_name} at {attempt=}/{max_retries}: "
+                f"judge request timed out after {_REQUEST_TIMEOUT_SECONDS}s"
+                f"retrying in {retry_delay}s..."
+
+            )
+
+            if attempt >= max_retries:
+                raise TimeoutError(
+                    f"Judge request timed out after {max_retries} attempts "
+                    f"({_REQUEST_TIMEOUT_SECONDS}s per attempt)"
+                ) from exc
+
+            await asyncio.sleep(retry_delay)
+
         except Exception as exc:
             if _CONTEXT_LENGTH_ERROR_MESSAGE in str(exc):
                 # don't bother retrying, the hosted judge cannot handle it.
                 if raise_on_context_length_error:
                     raise BadRequestError from exc
                 return {}
+            retry_delay = _get_retry_delay(attempt)
             print(
                 f"[WARNING] {env_name} at {attempt=}/{max_retries}: judge request failed "
                 f"with error {type(exc).__name__}: {exc!r}; "
-                f"retrying in {_WAIT_SECONDS_BEFORE_RETRY} second(s)..."
+                f"retrying in {retry_delay}s..."
             )
-            await asyncio.sleep(_WAIT_SECONDS_BEFORE_RETRY + random.uniform(0, 1))
+            await asyncio.sleep(retry_delay)
     print(
         f"[WARNING] {env_name} at {attempt=}/{max_retries}: Maximum _post_chat_completions retries reached; "
         "returning empty judge response (verdict will default to NOT EQUAL / NO / score 0.0)."
