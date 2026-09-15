@@ -1,5 +1,6 @@
 """Tests for the outsourced GenRM Compare Resources Server."""
 
+import asyncio
 from typing import Any, Dict
 from unittest.mock import AsyncMock, MagicMock
 
@@ -12,7 +13,6 @@ from nemo_gym.openai_utils import (
     NeMoGymResponseCreateParamsNonStreaming,
 )
 from nemo_gym.server_utils import ServerClient
-
 from resources_servers.genrm_compare.app import (
     GenRMCompareConfig,
     GenRMCompareRequest,
@@ -72,6 +72,10 @@ class TestConfigRequiredFields:
         # This config must not carry the Gym-managed genrm_model_server.
         cfg = _make_config()
         assert not hasattr(cfg, "genrm_model_server") or "genrm_model_server" not in cfg.model_fields
+
+    def test_default_genrm_endpoint_max_concurrency(self):
+        cfg = _make_config()
+        assert cfg.genrm_endpoint_max_concurrency == 512
 
 
 class TestInheritedComparison:
@@ -196,12 +200,11 @@ class TestRunSingleComparisonOutsource:
         """response_1 / response_2 are sent as custom-role chat messages with the
         env-local parse-retry transport flags."""
         server = self._make_server(use_principle=False)
+        server._genrm_endpoint_semaphore = asyncio.Semaphore(3)
         conversation = [{"role": "user", "content": "What is 2+2?"}]
 
         post_mock = AsyncMock(return_value=self._make_genrm_response(4, 2, 2))
         monkeypatch.setattr("resources_servers.genrm_compare.app._post_chat_completions", post_mock)
-
-        import asyncio
 
         score_1, score_2, ranking = asyncio.run(
             server._run_single_comparison(
@@ -218,6 +221,7 @@ class TestRunSingleComparisonOutsource:
         assert args[0] == "genrm_compare"
         assert kwargs["max_retries"] == 1
         assert kwargs["raise_on_context_length_error"] is True
+        assert kwargs["semaphore"] is server._genrm_endpoint_semaphore
 
         payload = args[2]
         roles = [m["role"] for m in payload["messages"]]
@@ -431,3 +435,52 @@ class TestRewardNormalization:
         # raw scores 4 and 3 (no tiebreak) -> (4 + 1.5) / 9 and (3 + 1.5) / 9
         assert res.rewards[0] == pytest.approx((4.0 + 1.5) / 9.0)
         assert res.rewards[1] == pytest.approx((3.0 + 1.5) / 9.0)
+
+
+class TestGenRMEndpointSemaphore:
+    """The outsource GenRM transport is bounded by a per-process semaphore."""
+
+    def test_setup_webserver_builds_semaphore(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "resources_servers.genrm_compare.app._validate_and_setup_judge_endpoint",
+            lambda *args, **kwargs: "http://judge.local:1234",
+        )
+        cfg = _make_config(genrm_endpoint_max_concurrency=7)
+        server = GenRMCompareResourcesServer.model_construct(config=cfg, server_client=MagicMock())
+
+        server.setup_webserver()
+
+        assert isinstance(server._genrm_endpoint_semaphore, asyncio.Semaphore)
+        assert server._genrm_endpoint_semaphore._value == 7
+        assert server._genrm_chat_completions_url == "http://judge.local:1234/v1/chat/completions"
+
+    def test_zero_concurrency_disables_cap(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "resources_servers.genrm_compare.app._validate_and_setup_judge_endpoint",
+            lambda *args, **kwargs: "http://judge.local:1234",
+        )
+        cfg = _make_config(genrm_endpoint_max_concurrency=0)
+        server = GenRMCompareResourcesServer.model_construct(config=cfg, server_client=MagicMock())
+
+        server.setup_webserver()
+
+        assert server._genrm_endpoint_semaphore is None
+
+    def test_semaphore_forwarded_to_transport(self, monkeypatch) -> None:
+        cfg = _make_config()
+        server = GenRMCompareResourcesServer.model_construct(config=cfg, server_client=MagicMock())
+        server._genrm_endpoint_semaphore = asyncio.Semaphore(3)
+
+        response = {"choices": [{"message": {"content": '{"score_1": 4, "score_2": 2, "ranking": 2}'}}]}
+        post_mock = AsyncMock(return_value=response)
+        monkeypatch.setattr("resources_servers.genrm_compare.app._post_chat_completions", post_mock)
+
+        asyncio.run(
+            server._run_single_comparison(
+                [{"role": "user", "content": "What is 2+2?"}],
+                {"output": [{"type": "message", "content": [{"type": "output_text", "text": "4"}]}]},
+                {"output": [{"type": "message", "content": [{"type": "output_text", "text": "Four"}]}]},
+            )
+        )
+
+        assert post_mock.await_args.kwargs["semaphore"] is server._genrm_endpoint_semaphore

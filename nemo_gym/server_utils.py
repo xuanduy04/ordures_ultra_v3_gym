@@ -15,6 +15,7 @@
 import asyncio
 import atexit
 import json
+import random
 import resource
 import sys
 import time
@@ -187,7 +188,7 @@ async def request(
                     flush=True,
                 )
 
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(random.random() * 10)
         except ClientOSError:
             global _NUM_CLIENT_OS_ERROR
             _NUM_CLIENT_OS_ERROR += 1
@@ -199,7 +200,7 @@ async def request(
                     flush=True,
                 )
 
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(random.random() * 10)
         except Exception as e:
             if _GLOBAL_AIOHTTP_CLIENT_REQUEST_DEBUG:
                 print_exc()
@@ -207,16 +208,15 @@ async def request(
             # Don't increment internal since we know we are ok. If we are not, the head server will shut everything down anyways.
             if not _internal:
                 print(
-                    f"""Hit an exception while making a request (try {num_tries}): {type(e)}: {e}
-Sleeping 0.5s and retrying...
-"""
+                    f"Hit an exception while making a request (try {num_tries}): {type(e)}: {e} "
+                    f"Sleeping for some seconds then retrying..."
                 )
                 if num_tries >= MAX_NUM_TRIES:
                     raise e
 
                 num_tries += 1
 
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(random.random() * 10)
 
 
 async def raise_for_status(response: ClientResponse) -> None:  # pragma: no cover

@@ -27,12 +27,13 @@ from __future__ import annotations
 
 import asyncio
 import random
-from typing import Any
+from contextlib import nullcontext
+from typing import Any, Optional
 from urllib.parse import urlparse
 
 import requests
 import urllib3
-from aiohttp import ClientTimeout
+from aiohttp import ClientConnectionError, ClientTimeout
 from openai import BadRequestError
 
 from nemo_gym.openai_utils import NeMoGymEasyInputMessage, NeMoGymResponseCreateParamsNonStreaming
@@ -51,12 +52,16 @@ _REQUEST_TIMEOUT_SECONDS: int = 2767
 _MODELS_FETCH_MAX_ATTEMPTS: int = 6
 _MODELS_FETCH_TIMEOUT: int = 10
 
+# Connection errors are retried without bound; print one warning every N retries.
+_CONNECTION_RETRY_LOG_INTERVAL: int = 25
+
 def _get_retry_delay(attempt: int) -> float:
     _RETRY_DELAY_BASE = 2.0
     _MAX_RETRY_DELAY = 26.7
 
-    backoff = min(_MAX_RETRY_DELAY, _RETRY_DELAY_BASE * (2 ** (attempt - 1)))
-    return random.uniform(0.0, backoff)
+    # Cap the exponent for numerical stability: connection retries are unbounded, so `attempt` can grow large.
+    backoff = min(_MAX_RETRY_DELAY, _RETRY_DELAY_BASE * (2 ** min(attempt - 1, 10)))
+    return random.random() * backoff  # way faster than random.uniform()
 
 # ---------------------------------------------------------------------------
 # URL normalisation
@@ -239,37 +244,58 @@ async def _post_chat_completions(
     payload: dict[str, Any],
     max_retries: int = _MAX_RETRIES,
     raise_on_context_length_error: bool = False,
+    semaphore: Optional[asyncio.Semaphore] = None,
 ) -> dict[str, Any]:
-    """POST a chat-completions request to the external judge with retry on
-    429/5xx.
+    """POST a chat-completions request to the external judge with retry on 429/5xx.
 
-    Returns the parsed JSON response, or ``{}`` on exhaustion (so verdict
-    defaults to NOT-EQUAL / NO / score 0.0).
+    ``semaphore`` bounds the number of simultaneous requests; further callers queue
+    without bound. Connection-class failures (disconnects, resets, connection timeouts)
+    are retried indefinitely with jittered exponential backoff, independently of 
+    ``max_retries``, so a slow judge is waited on instead of degraded to default scores.
+
+    Returns the parsed JSON response, or ``{}`` on exhaustion.
     """
     client = get_global_aiohttp_client()
-    timeout = ClientTimeout(total=_REQUEST_TIMEOUT_SECONDS)
-    headers = {"Content-Type": "application/json"}
+    # No total timeout: queueing behind the semaphore and slow judge responses
+    # must not expire the request. `sock_read` still guards a dead connection.
+    timeout = ClientTimeout(total=None, sock_read=_REQUEST_TIMEOUT_SECONDS)
+    headers = {"Content-Type": "application/json", "Connection": "close"}
     attempt = 0
+    connection_attempt = 0
     while attempt < max_retries:
         attempt += 1
         try:
-            async with client.post(chat_completions_url, json=payload, headers=headers, timeout=timeout, ssl=False) as response:
-                if response.status in _RETRYABLE_STATUS_CODES:
-                    retry_delay = _get_retry_delay(attempt)
-                    body = await response.text()
-                    print(
-                        f"[WARNING] {env_name} at {attempt=}/{max_retries}: judge request "
-                        f"returned status code ({response.status}) with body ({body[:300]}); "
-                        f"retrying in {retry_delay}s..."
-                    )
-                    await asyncio.sleep(retry_delay)
-                    continue
-                if response.status >= 400:
-                    body = await response.text()
-                    raise ValueError(
-                        f"judge request failed with non-retryable status {response.status}: {body[:500]}"
-                    )
-                return await response.json()
+            async with (semaphore if semaphore is not None else nullcontext()):
+                async with client.post(chat_completions_url, json=payload, headers=headers, timeout=timeout, ssl=False) as response:
+                    if response.status in _RETRYABLE_STATUS_CODES:
+                        retry_delay = _get_retry_delay(attempt)
+                        body = await response.text()
+                        print(
+                            f"[WARNING] {env_name} at {attempt=}/{max_retries}: judge request "
+                            f"returned status code ({response.status}) with body ({body[:300]}); "
+                            f"retrying in {retry_delay}s..."
+                        )
+                        await asyncio.sleep(retry_delay)
+                        continue
+                    if response.status >= 400:
+                        body = await response.text()
+                        raise ValueError(
+                            f"judge request failed with non-retryable status {response.status}: {body[:500]}"
+                        )
+                    return await response.json()
+
+        except ClientConnectionError as exc:
+            # Server disconnects / resets / connection timeouts are expected while
+            # the judge is slow; retry without consuming the bounded attempt budget.
+            connection_attempt += 1
+            retry_delay = _get_retry_delay(connection_attempt)
+            if connection_attempt == 1 or connection_attempt % _CONNECTION_RETRY_LOG_INTERVAL == 0:
+                print(
+                    f"[WARNING] {env_name}: judge connection error (most likely due to slow judge server)"
+                    f"({type(exc).__name__}: {exc!r}); retry {connection_attempt} in {retry_delay:.1f}s..."
+                )
+            await asyncio.sleep(retry_delay)
+            attempt -= 1
 
         except (asyncio.TimeoutError, TimeoutError) as exc:
             retry_delay = _get_retry_delay(attempt)
@@ -277,7 +303,6 @@ async def _post_chat_completions(
                 f"[WARNING] {env_name} at {attempt=}/{max_retries}: "
                 f"judge request timed out after {_REQUEST_TIMEOUT_SECONDS}s"
                 f"retrying in {retry_delay}s..."
-
             )
 
             if attempt >= max_retries:
@@ -303,6 +328,6 @@ async def _post_chat_completions(
             await asyncio.sleep(retry_delay)
     print(
         f"[WARNING] {env_name} at {attempt=}/{max_retries}: Maximum _post_chat_completions retries reached; "
-        "returning empty judge response (verdict will default to NOT EQUAL / NO / score 0.0)."
+        "returning empty judge response (verdict should default to NOT EQUAL / NO / score 0.0)."
     )
     return {}

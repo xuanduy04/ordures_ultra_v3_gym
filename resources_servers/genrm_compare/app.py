@@ -76,6 +76,7 @@ class GenRMCompareConfig(BaseResourcesServerConfig):
         genrm_server_url: host:port of the externally-hosted GenRM judge
         genrm_model: GenRM model name served at genrm_server_url
         genrm_responses_create_params: Base create params for GenRM calls
+        genrm_endpoint_max_concurrency: Max simultaneous in-flight GenRM requests (0 = unlimited)
         comparison_strategy: "all_pairs" or "circular"
         num_judges_per_comparison: Number of judge passes per pair (majority voting)
         aggregator_method: Method for aggregating scores
@@ -105,6 +106,10 @@ class GenRMCompareConfig(BaseResourcesServerConfig):
     genrm_responses_create_params: NeMoGymResponseCreateParamsNonStreaming = Field(
         description="Base parameters for GenRM model requests (max_output_tokens maps to max_tokens)"
     )
+
+    # Bounds simultaneous GenRM HTTP requests from this process; callers beyond
+    # the limit queue without bound. 0 or negative disables the cap.
+    genrm_endpoint_max_concurrency: int = 2048
 
     # Cohort-based verify: number of rollouts per prompt before running comparison (Difference 1)
     # When > 1, verify() buffers by prompt and runs comparison when cohort is full; rewards are relative to cohort.
@@ -194,11 +199,20 @@ class GenRMCompareResourcesServer(_OriginalGenRMCompareResourcesServer):
     # Derived in setup_webserver() from config.genrm_server_url; not a YAML field.
     _genrm_chat_completions_url: str = ""
 
+    # Bounds simultaneous GenRM HTTP requests; None = unlimited. Set in setup_webserver().
+    _genrm_endpoint_semaphore: Optional[asyncio.Semaphore] = None
+
     def setup_webserver(self):
         normalized = _validate_and_setup_judge_endpoint(
             "genrm_compare", self.config.genrm_server_url, self.config.genrm_model
         )
         self._genrm_chat_completions_url = f"{normalized}/v1/chat/completions"
+
+        max_concurrency = self.config.genrm_endpoint_max_concurrency
+        self._genrm_endpoint_semaphore = (
+            asyncio.Semaphore(value=max_concurrency) if max_concurrency > 0 else None
+        )
+
         return super().setup_webserver()
 
     async def verify(self, body: GenRMCompareVerifyRequest) -> BaseVerifyResponse:
@@ -304,7 +318,8 @@ class GenRMCompareResourcesServer(_OriginalGenRMCompareResourcesServer):
                 try:
                     response_json = await _post_chat_completions(
                         "genrm_compare", self._genrm_chat_completions_url, payload,
-                        max_retries=1, raise_on_context_length_error=True
+                        max_retries=1, raise_on_context_length_error=True,
+                        semaphore=self._genrm_endpoint_semaphore,
                     )
                     genrm_answer = _extract_chat_completion_text(response_json)
 

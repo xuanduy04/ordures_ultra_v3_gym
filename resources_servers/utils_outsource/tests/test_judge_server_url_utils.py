@@ -13,15 +13,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
+
+import aiohttp
 import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestServer
 
 from nemo_gym.openai_utils import NeMoGymEasyInputMessage, NeMoGymResponseCreateParamsNonStreaming
-
+from resources_servers.utils_outsource import judge_server_url_utils as jsu
 from resources_servers.utils_outsource.judge_server_url_utils import (
     _build_chat_completions_payload,
     _extract_chat_completion_text,
     _messages_to_chat_format,
     _normalize_judge_server_url,
+    _post_chat_completions,
 )
 
 
@@ -116,3 +122,98 @@ class TestExtractChatCompletionText:
     def test_no_choices(self):
         assert _extract_chat_completion_text({}) == ""
         assert _extract_chat_completion_text({"choices": []}) == ""
+
+
+@pytest.fixture
+async def client_session(monkeypatch):
+    session = aiohttp.ClientSession(
+        connector=aiohttp.TCPConnector(force_close=True), timeout=aiohttp.ClientTimeout()
+    )
+    monkeypatch.setattr(jsu, "get_global_aiohttp_client", lambda: session)
+    yield session
+    await session.close()
+
+
+@pytest.fixture
+async def fake_judge():
+    servers = []
+
+    async def start(handler):
+        app = web.Application()
+        app.router.add_post("/v1/chat/completions", handler)
+        server = TestServer(app)
+        await server.start_server()
+        servers.append(server)
+        return str(server.make_url("/v1/chat/completions"))
+
+    yield start
+
+    for server in servers:
+        await server.close()
+
+
+class TestPostChatCompletions:
+    """Transport behavior of _post_chat_completions: connection retries, semaphore, no total timeout."""
+
+    def _payload(self):
+        return {"model": "m", "messages": [{"role": "user", "content": "hi"}], "stream": False}
+
+    async def test_connection_drops_retried_beyond_max_retries(self, client_session, fake_judge, monkeypatch):
+        """A disconnect must not consume the bounded attempt budget: max_retries=1 still succeeds."""
+        monkeypatch.setattr(jsu, "_get_retry_delay", lambda attempt: 0.0)
+        drops = {"count": 0}
+
+        async def handler(request):
+            if drops["count"] < 2:
+                drops["count"] += 1
+                request.transport.abort()
+                return web.Response()
+            return web.json_response({"choices": [{"message": {"content": "ok"}}]})
+
+        url = await fake_judge(handler)
+        result = await _post_chat_completions("test_env", url, self._payload(), max_retries=1)
+
+        assert drops["count"] == 2
+        assert result["choices"][0]["message"]["content"] == "ok"
+
+    async def test_semaphore_caps_simultaneous_requests(self, client_session, fake_judge):
+        state = {"inflight": 0, "max_inflight": 0}
+
+        async def handler(request):
+            state["inflight"] += 1
+            state["max_inflight"] = max(state["max_inflight"], state["inflight"])
+            await asyncio.sleep(0.05)
+            state["inflight"] -= 1
+            return web.json_response({"choices": [{"message": {"content": "ok"}}]})
+
+        url = await fake_judge(handler)
+        semaphore = asyncio.Semaphore(2)
+        results = await asyncio.gather(
+            *[_post_chat_completions("test_env", url, self._payload(), semaphore=semaphore) for _ in range(6)]
+        )
+
+        assert all(r["choices"][0]["message"]["content"] == "ok" for r in results)
+        assert state["max_inflight"] <= 2
+
+    async def test_no_total_timeout_and_connection_close(self, client_session, fake_judge, monkeypatch):
+        captured = {}
+        real_timeout = aiohttp.ClientTimeout
+
+        def spy_timeout(**kwargs):
+            captured.update(kwargs)
+            return real_timeout(**kwargs)
+
+        monkeypatch.setattr(jsu, "ClientTimeout", spy_timeout)
+        seen_headers = {}
+
+        async def handler(request):
+            seen_headers.update(request.headers)
+            return web.json_response({"choices": [{"message": {"content": "ok"}}]})
+
+        url = await fake_judge(handler)
+        result = await _post_chat_completions("test_env", url, self._payload())
+
+        assert result["choices"][0]["message"]["content"] == "ok"
+        assert captured["total"] is None
+        assert captured["sock_read"] == jsu._REQUEST_TIMEOUT_SECONDS
+        assert seen_headers["Connection"] == "close"
