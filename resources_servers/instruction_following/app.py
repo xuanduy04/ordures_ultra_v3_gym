@@ -75,6 +75,7 @@ class InstructionFollowingResourcesServer(SimpleResourcesServer):
             pass
         except Exception as e:
             print(f"NLTK setup warning: {e}")
+            exit(1)
 
     def setup_webserver(self) -> FastAPI:
         app = super().setup_webserver()
