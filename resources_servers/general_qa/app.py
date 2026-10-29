@@ -18,13 +18,14 @@ strategy).
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 from io import StringIO
 from typing import Any, Callable, ClassVar, List, Optional
 
 from fastapi import FastAPI
 from math_verify.errors import TimeoutException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from nemo_gym.base_resources_server import (
     BaseResourcesServerConfig,
@@ -39,6 +40,14 @@ from nemo_gym.openai_utils import (
     NeMoGymResponseCreateParamsNonStreaming,
     NeMoGymResponseOutputMessage,
     NeMoGymResponseOutputText,
+)
+from resources_servers.single_step_tool_use_with_argument_comparison.common.response_utils import (
+    extract_tool_call_or_text,
+)
+from resources_servers.single_step_tool_use_with_argument_comparison.common.verification_utils import (
+    ExpectedFunctionCall,
+    ToolCallComparator,
+    ToolCallComparatorConfig,
 )
 from resources_servers.utils_outsource.judge_server_url_utils import (
     _build_chat_completions_payload,
@@ -58,6 +67,7 @@ class GeneralQARunRequest(BaseRunRequest):
     question: Optional[Any]
     expected_answer: str
     should_use_judge: Optional[bool]
+    answer_is_tool_call: bool = False
 
 
 class GeneralQAVerifyRequest(GeneralQARunRequest, BaseVerifyRequest):
@@ -95,6 +105,8 @@ class GeneralQAResourcesServerConfig(BaseResourcesServerConfig):
     )
 
     should_use_judge: bool = False
+
+    tool_call_comparator_config: ToolCallComparatorConfig
 
 
 def _build_judge_response(judge_text: str, judge_model: str) -> NeMoGymResponse:
@@ -354,6 +366,16 @@ The question does not request a specific answer style or format. The correctness
         return super().setup_webserver()
 
     async def verify(self, body: GeneralQAVerifyRequest) -> GeneralQAVerifyResponse:
+        if body.answer_is_tool_call:
+            reward, extracted_answer = self._verify_tool_call_answer(body.response, body.expected_answer)
+            return GeneralQAVerifyResponse(
+                **body.model_dump(),
+                reward=reward,
+                extracted_answer=extracted_answer,
+                deter_reward=reward,
+                judge_evaluations=None,
+            )
+
         assistant_responses = []
         for output_item in body.response.output:
             if output_item.type != "message":
@@ -433,6 +455,29 @@ The question does not request a specific answer style or format. The correctness
 
         except (Exception, TimeoutException):
             return 0.0, None
+
+    def _verify_tool_call_answer(
+        self, response: NeMoGymResponse, expected_answer: str
+    ) -> tuple[float, Optional[str]]:
+        """Verify the correctness of a generated answer when the expected answer is a tool call.
+
+        The generated answer is judged incorrect if it is not a tool call.
+        Otherwise, the tool call is compared against the expected tool call
+        (parsed from ``expected_answer``) using the same comparison method as
+        the single-step tool-use environment.
+        """
+        extracted = extract_tool_call_or_text(response)
+        if extracted is None or extracted.type != "function_call":
+            return 0.0, None
+
+        try:
+            expected_action = ExpectedFunctionCall.model_validate(json.loads(expected_answer))
+        except (json.JSONDecodeError, ValidationError):
+            return 0.0, None
+
+        tool_call_comparator = ToolCallComparator(config=self.config.tool_call_comparator_config)
+        reward, _category = tool_call_comparator.compare_tool_call(expected_action, extracted)
+        return reward, None
 
     async def _verify_answer_with_judge(
         self, question: str, expected_answer: str, generated_answer: str

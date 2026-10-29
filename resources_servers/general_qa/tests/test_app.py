@@ -1,3 +1,4 @@
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -5,6 +6,7 @@ import pytest
 from nemo_gym.openai_utils import (
     NeMoGymResponse,
     NeMoGymResponseCreateParamsNonStreaming,
+    NeMoGymResponseFunctionToolCall,
     NeMoGymResponseOutputMessage,
     NeMoGymResponseOutputText,
 )
@@ -15,6 +17,9 @@ from resources_servers.general_qa.app import (
     GeneralQAResourcesServerConfig,
     GeneralQAVerifyRequest,
     _build_judge_response,
+)
+from resources_servers.single_step_tool_use_with_argument_comparison.common.verification_utils import (
+    ToolCallComparatorConfig,
 )
 from resources_servers.utils_qa.extract_answer import extract_answer
 from resources_servers.utils_qa.verify_answer import (
@@ -33,6 +38,7 @@ def _make_config(**overrides):
         judge_server_url="0.0.0.0:8000",
         judge_model="test-model",
         judge_responses_create_params=NeMoGymResponseCreateParamsNonStreaming(input=[]),
+        tool_call_comparator_config=ToolCallComparatorConfig(word_count_similarity_threshold=0.1),
     )
     base.update(overrides)
     return GeneralQAResourcesServerConfig(**base)
@@ -83,6 +89,7 @@ class TestConfigRequiredFields:
             judge_server_url="0.0.0.0:8000",
             judge_model="m",
             judge_responses_create_params=NeMoGymResponseCreateParamsNonStreaming(input=[]),
+            tool_call_comparator_config=ToolCallComparatorConfig(word_count_similarity_threshold=0.1),
         )
         assert cfg.name == "general_qa"
 
@@ -370,3 +377,119 @@ class TestVerifyQuestionField:
         assert post_mock.await_count == 0
         assert resp.judge_evaluations is None
         assert resp.reward == resp.deter_reward
+
+
+class TestToolCallAnswer:
+    def _make_server(self):
+        cfg = _make_config()
+        mock_client = MagicMock(spec=ServerClient)
+        server = GeneralQAResourcesServer.model_construct(config=cfg, server_client=mock_client)
+        server.model_post_init(None)
+        return server
+
+    def _make_model_response(self, output):
+        return NeMoGymResponse(
+            id="resp_id",
+            created_at=0.0,
+            model="model",
+            object="response",
+            output=output,
+            parallel_tool_calls=False,
+            tool_choice="none",
+            tools=[],
+        )
+
+    def _make_text_output(self, text):
+        return [
+            NeMoGymResponseOutputMessage(
+                id="msg_id",
+                content=[NeMoGymResponseOutputText(annotations=[], text=text, type="output_text")],
+                role="assistant",
+                status="completed",
+                type="message",
+            )
+        ]
+
+    def _make_tool_call_output(self, name, arguments):
+        return [NeMoGymResponseFunctionToolCall(arguments=arguments, call_id="call_1", name=name)]
+
+    def _make_expected_tool_answer(self, name, arguments_obj):
+        return f'{{"type": "function_call", "name": "{name}", "arguments": {json.dumps(json.dumps(arguments_obj))}}}'
+
+    def _make_verify_request(self, response, expected_answer, answer_is_tool_call=True):
+        return GeneralQAVerifyRequest(
+            responses_create_params=NeMoGymResponseCreateParamsNonStreaming(input=[]),
+            response=response,
+            question="What is the weather in Paris?",
+            expected_answer=expected_answer,
+            should_use_judge=False,
+            answer_is_tool_call=answer_is_tool_call,
+        )
+
+    def test_answer_is_tool_call_defaults_to_false(self):
+        req = GeneralQAVerifyRequest(
+            responses_create_params=NeMoGymResponseCreateParamsNonStreaming(input=[]),
+            response=self._make_model_response(self._make_text_output("Paris")),
+            question=None,
+            expected_answer="Paris",
+            should_use_judge=False,
+        )
+        assert req.answer_is_tool_call is False
+
+    async def test_matching_tool_call(self):
+        server = self._make_server()
+        expected = self._make_expected_tool_answer("get_weather", {"city": "Paris"})
+        response = self._make_model_response(self._make_tool_call_output("get_weather", '{"city": "Paris"}'))
+        resp = await server.verify(self._make_verify_request(response, expected))
+
+        assert resp.reward == 1.0
+        assert resp.deter_reward == 1.0
+        assert resp.extracted_answer is None
+        assert resp.judge_evaluations is None
+
+    async def test_text_answer_when_tool_expected(self):
+        server = self._make_server()
+        expected = self._make_expected_tool_answer("get_weather", {"city": "Paris"})
+        response = self._make_model_response(self._make_text_output("The weather is sunny"))
+        resp = await server.verify(self._make_verify_request(response, expected))
+
+        assert resp.reward == 0.0
+
+    async def test_empty_output_when_tool_expected(self):
+        server = self._make_server()
+        expected = self._make_expected_tool_answer("get_weather", {"city": "Paris"})
+        response = self._make_model_response([])
+        resp = await server.verify(self._make_verify_request(response, expected))
+
+        assert resp.reward == 0.0
+
+    async def test_wrong_tool_name(self):
+        server = self._make_server()
+        expected = self._make_expected_tool_answer("get_weather", {"city": "Paris"})
+        response = self._make_model_response(self._make_tool_call_output("get_time", '{"city": "Paris"}'))
+        resp = await server.verify(self._make_verify_request(response, expected))
+
+        assert resp.reward == 0.0
+
+    async def test_wrong_tool_arguments(self):
+        server = self._make_server()
+        expected = self._make_expected_tool_answer("get_weather", {"city": "Paris"})
+        response = self._make_model_response(self._make_tool_call_output("get_weather", '{"city": "London"}'))
+        resp = await server.verify(self._make_verify_request(response, expected))
+
+        assert resp.reward == 0.0
+
+    async def test_malformed_model_arguments_json(self):
+        server = self._make_server()
+        expected = self._make_expected_tool_answer("get_weather", {"city": "Paris"})
+        response = self._make_model_response(self._make_tool_call_output("get_weather", "not json"))
+        resp = await server.verify(self._make_verify_request(response, expected))
+
+        assert resp.reward == 0.0
+
+    async def test_malformed_expected_answer(self):
+        server = self._make_server()
+        response = self._make_model_response(self._make_tool_call_output("get_weather", '{"city": "Paris"}'))
+        resp = await server.verify(self._make_verify_request(response, "not json"))
+
+        assert resp.reward == 0.0
