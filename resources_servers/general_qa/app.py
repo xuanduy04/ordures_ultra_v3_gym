@@ -2,8 +2,8 @@
 General QA Environment Resources Server.
 
 This is a standalone (not inherited) QA resource server. It verifies model
-responses against expected answers using three deterministic verifiers
-(exact match, math-verify, F1) plus an optional externally-hosted LLM judge.
+responses against expected answers using three deterministic verifiers (exact
+match, math-verify, F1) plus an optional externally-hosted LLM judge.
 
 The LLM-judge is NOT managed by NeMo-Gym — the YAML config must supply a
 ``judge_server_url`` (host:port, e.g. ``0.0.0.0:8000``) pointing at an
@@ -18,13 +18,14 @@ strategy).
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 from io import StringIO
 from typing import Any, Callable, ClassVar, List, Optional
 
 from fastapi import FastAPI
 from math_verify.errors import TimeoutException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from nemo_gym.base_resources_server import (
     BaseResourcesServerConfig,
@@ -37,8 +38,17 @@ from nemo_gym.openai_utils import (
     NeMoGymEasyInputMessage,
     NeMoGymResponse,
     NeMoGymResponseCreateParamsNonStreaming,
+    NeMoGymResponseFunctionToolCall,
     NeMoGymResponseOutputMessage,
     NeMoGymResponseOutputText,
+)
+from resources_servers.single_step_tool_use_with_argument_comparison.common.response_utils import (
+    extract_tool_call_or_text,
+)
+from resources_servers.single_step_tool_use_with_argument_comparison.common.verification_utils import (
+    ExpectedFunctionCall,
+    ToolCallComparator,
+    ToolCallComparatorConfig,
 )
 from resources_servers.utils_outsource.judge_server_url_utils import (
     _build_chat_completions_payload,
@@ -58,6 +68,7 @@ class GeneralQARunRequest(BaseRunRequest):
     question: Optional[Any]
     expected_answer: str
     should_use_judge: Optional[bool]
+    answer_is_tool_call: bool = False
 
 
 class GeneralQAVerifyRequest(GeneralQARunRequest, BaseVerifyRequest):
@@ -77,7 +88,8 @@ class GeneralQAVerifyResponse(BaseVerifyResponse):
 
 
 class GeneralQAResourcesServerConfig(BaseResourcesServerConfig):
-    """Configuration for the GeneralQA environment server.
+    """
+    Configuration for the GeneralQA environment server.
 
     The LLM-judge is hosted externally (not managed by NeMo-Gym). Both
     ``judge_server_url`` and ``judge_model`` are mandated (no defaults).
@@ -96,10 +108,14 @@ class GeneralQAResourcesServerConfig(BaseResourcesServerConfig):
 
     should_use_judge: bool = False
 
+    tool_call_comparator_config: ToolCallComparatorConfig
+
 
 def _build_judge_response(judge_text: str, judge_model: str) -> NeMoGymResponse:
-    """Build a minimal NeMoGymResponse that wraps the chat-completions judge output
-    for compatibility with the ``JudgeEvaluation`` schema."""
+    """
+    Build a minimal NeMoGymResponse that wraps the chat-completions judge
+    output for compatibility with the ``JudgeEvaluation`` schema.
+    """
     return NeMoGymResponse(
         id="chat_completion_judge",
         created_at=0.0,
@@ -321,7 +337,6 @@ The question does not request a specific answer style or format. The correctness
 
 **NOTE**: If the question matches the exact string above with nothing else added before or after ("The question does not matter, there IS NOT ANY special formatting requirements. You may judge assistant answers by their contents and mathematical equivalence."), then judge as if the question had no formatting requirements (otherwise, you must look at the question in search of any answer formatting and style requirements). As the correctness of the answers with respect to the question have always been irrelevant, this does not change anything in regards to how answers are judged."""
 
-
     JUDGE_PROMPT_TEMPLATE: ClassVar[str] = (
         "<|Start of Question|>\n{question}\n<|End of Question|>\n\n<|Start of Assistant A's Answer|>\n{first_answer}\n<|End of Assistant A's Answer|>\n\n<|Start of Assistant B's Answer|>\n{second_answer}\n<|End of Assistant B's Answer|>"
     )
@@ -329,12 +344,16 @@ The question does not request a specific answer style or format. The correctness
     JUDGE_EQUAL_LABEL: ClassVar[str] = "[[A=B]]"
     JUDGE_NOT_EQUAL_LABEL: ClassVar[str] = "[[A!=B]]"
 
-    FALLBACK_QUESTION: ClassVar[str] = "The question does not matter, there IS NOT ANY special formatting requirements. You may judge assistant answers by their contents and mathematical equivalence."
+    FALLBACK_QUESTION: ClassVar[str] = (
+        "The question does not matter, there IS NOT ANY special formatting requirements. You may judge assistant answers by their contents and mathematical equivalence."
+    )
 
-    config: GeneralQAResourcesServerConfig
+    config: GeneralQAResourcesServerConfig  # pyrefly: ignore[bad-override]
 
     # Derived in setup_webserver() from config.judge_server_url; not a YAML field.
     _judge_chat_completions_url: str = ""
+
+    _verifiers: list[Callable[[list[str], list[str]], float]] = []
 
     def model_post_init(self, context: Any) -> None:
         super().model_post_init(context)
@@ -353,14 +372,24 @@ The question does not request a specific answer style or format. The correctness
         self._judge_chat_completions_url = f"{normalized}/v1/chat/completions"
         return super().setup_webserver()
 
-    async def verify(self, body: GeneralQAVerifyRequest) -> GeneralQAVerifyResponse:
+    async def verify(self, body: GeneralQAVerifyRequest) -> GeneralQAVerifyResponse:  # pyrefly: ignore[bad-override]
+        if body.answer_is_tool_call:
+            reward, extracted_answer = self._verify_tool_call_answer(body.response, body.expected_answer)
+            return GeneralQAVerifyResponse(
+                **body.model_dump(),
+                reward=reward,
+                extracted_answer=extracted_answer,
+                deter_reward=reward,
+                judge_evaluations=None,
+            )
+
         assistant_responses = []
         for output_item in body.response.output:
-            if output_item.type != "message":
+            if not isinstance(output_item, NeMoGymResponseOutputMessage):
                 continue
 
             for content_item in output_item.content:
-                if content_item.type != "output_text":
+                if not isinstance(content_item, NeMoGymResponseOutputText):
                     continue
 
                 assistant_responses.append(content_item.text)
@@ -370,6 +399,14 @@ The question does not request a specific answer style or format. The correctness
         else:
             question_str = body.question.strip() or self.FALLBACK_QUESTION
         combined_response = "".join(assistant_responses)
+        if not combined_response:
+            return GeneralQAVerifyResponse(
+                **body.model_dump(),
+                reward=0.0,
+                extracted_answer=None,
+                deter_reward=0.0,
+                judge_evaluations=None,
+            )
         (
             reward,
             extracted_answer,
@@ -388,7 +425,8 @@ The question does not request a specific answer style or format. The correctness
     async def _verify_answer(
         self, question: str, expected_answer: str, generated_answer: str, should_use_judge: bool | None = None
     ) -> tuple[float, Optional[str], float, Optional[list[JudgeEvaluation]]]:
-        """Verify the correctness of a generated answer.
+        """
+        Verify the correctness of a generated answer.
 
         Verify the correctness of the specified model-generated answer to the
         in comparison with the specified expected answer.
@@ -415,8 +453,12 @@ The question does not request a specific answer style or format. The correctness
         ):
             yield
 
-    def _verify_answer_deterministically(self, expected_answer: str, generated_answer: str) -> tuple[float, str | None]:
-        """Verify the correctness of a generated answer using deterministic methods.
+    def _verify_answer_deterministically(
+        self, expected_answer: str, generated_answer: str
+    ) -> tuple[float, str | None]:
+        """
+        Verify the correctness of a generated answer using deterministic
+        methods.
         """
         try:
             # try to manually parse the answer
@@ -426,13 +468,35 @@ The question does not request a specific answer style or format. The correctness
                 extracted = generated_answer  # default to generated_answer
 
             with self._mute_output():
-                ret_score = max(verifier([expected_answer], [extracted])
-                                for verifier in self._verifiers)
+                ret_score = max(verifier([expected_answer], [extracted]) for verifier in self._verifiers)
 
             return float(ret_score), extracted
 
         except (Exception, TimeoutException):
             return 0.0, None
+
+    def _verify_tool_call_answer(self, response: NeMoGymResponse, expected_answer: str) -> tuple[float, Optional[str]]:
+        """
+        Verify the correctness of a generated answer when the expected answer
+        is a tool call.
+
+        The generated answer is judged incorrect if it is not a tool call.
+        Otherwise, the tool call is compared against the expected tool call
+        (parsed from ``expected_answer``) using the same comparison method as
+        the single-step tool-use environment.
+        """
+        extracted = extract_tool_call_or_text(response)
+        if extracted is None or not isinstance(extracted, NeMoGymResponseFunctionToolCall):
+            return 0.0, None
+
+        try:
+            expected_action = ExpectedFunctionCall.model_validate(json.loads(expected_answer))
+        except (json.JSONDecodeError, ValidationError):
+            return 0.0, None
+
+        tool_call_comparator = ToolCallComparator(config=self.config.tool_call_comparator_config)
+        reward, _category = tool_call_comparator.compare_tool_call(expected_action, extracted)
+        return reward, None
 
     async def _verify_answer_with_judge(
         self, question: str, expected_answer: str, generated_answer: str
@@ -460,11 +524,13 @@ The question does not request a specific answer style or format. The correctness
     async def _generate_judge_evaluation(
         self, question: str, first_answer: str, second_answer: str
     ) -> tuple[bool, JudgeEvaluation]:
-        """Evaluate whether the two answers are equivalent using the externally-hosted LLM judge.
+        """
+        Evaluate whether the two answers are equivalent using the
+        externally-hosted LLM judge.
 
-        Call ``{judge_server_url}/v1/chat/completions`` instead of the Gym-managed
-        ``/v1/responses`` endpoint. Verdict parsing logic ([[A=B]] / [[A!=B]] label
-        scanning) is identical to the original.
+        Call ``{judge_server_url}/v1/chat/completions`` instead of the
+        Gym-managed ``/v1/responses`` endpoint. Verdict parsing logic ([[A=B]]
+        / [[A!=B]] label scanning) is identical to the original.
         """
         responses_create_params = self.config.judge_responses_create_params.model_copy(deep=True)
 
@@ -478,9 +544,7 @@ The question does not request a specific answer style or format. The correctness
         responses_create_params.input = msgs
 
         payload = _build_chat_completions_payload(responses_create_params, msgs, self.config.judge_model)
-        response_json = await _post_chat_completions(
-            "general_qa", self._judge_chat_completions_url, payload
-        )
+        response_json = await _post_chat_completions("general_qa", self._judge_chat_completions_url, payload)
         judge_text = _extract_chat_completion_text(response_json)
 
         judge_response = _build_judge_response(judge_text, self.config.judge_model)

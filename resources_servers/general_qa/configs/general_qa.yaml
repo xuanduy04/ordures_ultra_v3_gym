@@ -29,13 +29,15 @@ general_qa:
         input: []
       }
       should_use_judge: false
+      tool_call_comparator_config:
+        word_count_similarity_threshold: 0.1
       domain: knowledge
       verified: false
       description: General QA dataset with extractive verifiers and LLM-as-a-judge
       value: Improve general question answering capabilities
 general_qa_simple_agent:
   responses_api_agents:
-    simple_agent:
+    tool_simulation_agent:
       entrypoint: app.py
       resources_server:
         type: resources_servers
@@ -71,7 +73,7 @@ general_qa_simple_agent:
         jsonl_fpath: resources_servers/general_qa/data/example.jsonl
 general_qa_simple_agent_reasoning_off:
   responses_api_agents:
-    simple_agent:
+    tool_simulation_agent:
       entrypoint: app.py
       resources_server:
         type: resources_servers

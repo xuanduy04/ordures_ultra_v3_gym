@@ -659,6 +659,8 @@ Full body: {json.dumps(exc.body, indent=4)}
             timeout_graceful_shutdown=0.5,
             # Some workers may take a while for imports and setup_webserver.
             timeout_worker_healthcheck=30,
+            # Extending queue backlog
+            backlog=4096,
         )
 
         if server.config.num_workers and server.config.num_workers > 1:
