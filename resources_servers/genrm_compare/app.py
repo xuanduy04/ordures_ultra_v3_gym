@@ -2,20 +2,21 @@
 GenRM Pairwise Comparison Resources Server.
 
 This is the production GenRM Compare server. The GenRM model judge is NOT
-managed by NeMo-Gym — the YAML config must supply a ``genrm_server_url``
-(a bare ``host:port``, e.g. ``0.0.0.0:8000``) pointing at an already-running
-GenRM model endpoint, plus a ``genrm_model`` name.
+managed by NeMo-Gym — the YAML config must supply a ``genrm_server_url`` (a
+bare ``host:port``, e.g. ``0.0.0.0:8000``) pointing at an already-running GenRM
+model endpoint, plus a ``genrm_model`` name.
 
 The GenRM model is queried via the OpenAI **Chat Completions** API
 (``{genrm_server_url}/v1/chat/completions``) rather than the Responses API,
-since a stock ``vllm serve`` endpoint only exposes the chat-completions surface.
+since a stock ``vllm serve`` endpoint only exposes the chat-completions
+surface.
 
 All pairwise comparison / aggregation / parse / cohort-buffering / request /
 response schema logic is inherited unchanged from
 :class:`resources_servers.genrm_compare_original.app.GenRMCompareResourcesServer`.
-Both agents (``genrm_simple_agent`` and ``genrm_simple_agent_reasoning_off``) are
-YAML-defined wrappers around this server and work unchanged — the ``agent_ref.name``
-is ``genrm_simple_agent`` in the existing data.
+Both agents (``genrm_simple_agent`` and ``genrm_simple_agent_reasoning_off``)
+are YAML-defined wrappers around this server and work unchanged — the
+``agent_ref.name`` is ``genrm_simple_agent`` in the existing data.
 """
 
 from __future__ import annotations
@@ -76,15 +77,23 @@ class GenRMCompareConfig(BaseResourcesServerConfig):
         genrm_server_url: host:port of the externally-hosted GenRM judge
         genrm_model: GenRM model name served at genrm_server_url
         genrm_responses_create_params: Base create params for GenRM calls
-        genrm_endpoint_max_concurrency: Max simultaneous in-flight GenRM requests (0 = unlimited)
+        genrm_extra_body: Extra chat-completions body fields (e.g.
+            reasoning_effort, chat_template_kwargs) merged into every GenRM
+            request
+        genrm_endpoint_max_concurrency: Max simultaneous in-flight GenRM
+            requests (0 = unlimited)
         comparison_strategy: "all_pairs" or "circular"
-        num_judges_per_comparison: Number of judge passes per pair (majority voting)
+        num_judges_per_comparison: Number of judge passes per pair (majority
+            voting)
         aggregator_method: Method for aggregating scores
-        reasoning_bonus: Bonus for shortest reasoning content among top performers
+        reasoning_bonus: Bonus for shortest reasoning content among top
+            performers
         answer_bonus: Bonus for shortest answer among top performers
         top_percentile: Percentile threshold for applying bonuses
-        group_reasoning_length_penalty_coeff: Coefficient for reasoning length penalty
-        group_answer_length_penalty_coeff: Coefficient for answer length penalty
+        group_reasoning_length_penalty_coeff: Coefficient for reasoning length
+            penalty
+        group_answer_length_penalty_coeff: Coefficient for answer length
+            penalty
         default_score: Default neutral score when parsing fails
         default_ranking: Default neutral ranking when parsing fails
         debug_logging: Enable verbose logging for debugging
@@ -96,15 +105,17 @@ class GenRMCompareConfig(BaseResourcesServerConfig):
 
     name: str = "genrm_compare"
 
-    genrm_server_url: str = Field(
-        description="host:port of the externally-hosted GenRM judge (e.g. 0.0.0.0:8000)"
-    )
+    genrm_server_url: str = Field(description="host:port of the externally-hosted GenRM judge (e.g. 0.0.0.0:8000)")
     genrm_model: str = Field(
         description="GenRM model name served at genrm_server_url; sent as `model` in the judge payload"
     )
 
     genrm_responses_create_params: NeMoGymResponseCreateParamsNonStreaming = Field(
         description="Base parameters for GenRM model requests (max_output_tokens maps to max_tokens)"
+    )
+    genrm_extra_body: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Extra chat-completions body fields (e.g. reasoning_effort, chat_template_kwargs) merged into every GenRM request",
     )
 
     # Bounds simultaneous GenRM HTTP requests from this process; callers beyond
@@ -209,17 +220,15 @@ class GenRMCompareResourcesServer(_OriginalGenRMCompareResourcesServer):
         self._genrm_chat_completions_url = f"{normalized}/v1/chat/completions"
 
         max_concurrency = self.config.genrm_endpoint_max_concurrency
-        self._genrm_endpoint_semaphore = (
-            asyncio.Semaphore(value=max_concurrency) if max_concurrency > 0 else None
-        )
+        self._genrm_endpoint_semaphore = asyncio.Semaphore(value=max_concurrency) if max_concurrency > 0 else None
 
         return super().setup_webserver()
 
     async def verify(self, body: GenRMCompareVerifyRequest) -> BaseVerifyResponse:
         """Verify a single rollout (cohort-based), returning a [0, 1]-bounded reward.
 
-        Delegates all buffering / comparison / aggregation logic to the original
-        implementation, then clips the aggregated raw reward to
+        Delegates all buffering / comparison / aggregation logic to the
+        original implementation, then clips the aggregated raw reward to
         ``[reward_min, reward_max]`` and maps it linearly onto [0, 1].
         """
         result = await super().verify(body)
@@ -229,8 +238,8 @@ class GenRMCompareResourcesServer(_OriginalGenRMCompareResourcesServer):
         """Run a batch comparison, returning [0, 1]-bounded rewards.
 
         Delegates all pairwise comparison / aggregation logic to the original
-        implementation, then clips each aggregated raw reward to
-        ``[reward_min, reward_max]`` and maps it linearly onto [0, 1].
+        implementation, then clips each aggregated raw reward to ``[reward_min,
+        reward_max]`` and maps it linearly onto [0, 1].
         """
         result = await super().compare(body)
         return result.model_copy(update={"rewards": [self._normalize_reward(r) for r in result.rewards]})
@@ -240,9 +249,7 @@ class GenRMCompareResourcesServer(_OriginalGenRMCompareResourcesServer):
         reward_min = self.config._reward_min
         reward_max = self.config._reward_max
         if reward_max <= reward_min:
-            raise ValueError(
-                f"reward_max ({reward_max}) must be greater than reward_min ({reward_min})"
-            )
+            raise ValueError(f"reward_max ({reward_max}) must be greater than reward_min ({reward_min})")
         return (min(max(reward, reward_min), reward_max) - reward_min) / (reward_max - reward_min)
 
     async def _run_single_comparison(
@@ -291,19 +298,13 @@ class GenRMCompareResourcesServer(_OriginalGenRMCompareResourcesServer):
         if cfg.use_principle:
             principle_text = principle if principle else cfg.default_principle
             messages.append(
-                NeMoGymEasyInputMessage.model_construct(
-                    role="principle", content=principle_text, type="message"
-                )
+                NeMoGymEasyInputMessage.model_construct(role="principle", content=principle_text, type="message")
             )
 
         messages.extend(
             [
-                NeMoGymEasyInputMessage.model_construct(
-                    role="response_1", content=response_1, type="message"
-                ),
-                NeMoGymEasyInputMessage.model_construct(
-                    role="response_2", content=response_2, type="message"
-                ),
+                NeMoGymEasyInputMessage.model_construct(role="response_1", content=response_1, type="message"),
+                NeMoGymEasyInputMessage.model_construct(role="response_2", content=response_2, type="message"),
             ]
         )
 
@@ -313,12 +314,15 @@ class GenRMCompareResourcesServer(_OriginalGenRMCompareResourcesServer):
 
             for attempt_idx in range(max_attempts):
                 payload = _build_chat_completions_payload(
-                    cfg.genrm_responses_create_params, messages, cfg.genrm_model
+                    cfg.genrm_responses_create_params, messages, cfg.genrm_model, extra_body=cfg.genrm_extra_body
                 )
                 try:
                     response_json = await _post_chat_completions(
-                        "genrm_compare", self._genrm_chat_completions_url, payload,
-                        max_retries=1, raise_on_context_length_error=True,
+                        "genrm_compare",
+                        self._genrm_chat_completions_url,
+                        payload,
+                        max_retries=1,
+                        raise_on_context_length_error=True,
                         semaphore=self._genrm_endpoint_semaphore,
                     )
                     genrm_answer = _extract_chat_completion_text(response_json)
@@ -330,7 +334,7 @@ class GenRMCompareResourcesServer(_OriginalGenRMCompareResourcesServer):
                         raise_on_fail=True,
                     )
                     return score_1, score_2, ranking
-                
+
                 except (GenRMOutputParseError, TimeoutError) as e:
                     if attempt_idx < max_attempts - 1:
                         await asyncio.sleep(float(cfg.genrm_parse_retry_sleep_s))

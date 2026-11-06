@@ -1,13 +1,12 @@
-
 """
 Shared utilities for outsource Gym resource servers that connect to an
 externally-hosted LLM judge via ``judge_server_url``.
 
-Import these from new outsource ``app.py`` files instead of reimplementing
-them locally.  The functions mirror the patterns in
+Import these from new outsource ``app.py`` files instead of reimplementing them
+locally.  The functions mirror the patterns in
 ``examples/custom_rewards/utils/llm_judge_utils.py`` and
-``examples/custom_rewards/base_llm_judge.py``, but live inside the Gym tree
-so they are importable by resource-server venvs.
+``examples/custom_rewards/base_llm_judge.py``, but live inside the Gym tree so
+they are importable by resource-server venvs.
 """
 
 from __future__ import annotations
@@ -42,6 +41,7 @@ _MODELS_FETCH_TIMEOUT: int = 10
 # Connection errors are retried without bound; print one warning every N retries.
 _CONNECTION_RETRY_LOG_INTERVAL: int = 25
 
+
 def _get_retry_delay(attempt: int) -> float:
     _RETRY_DELAY_BASE = 2.0
     _MAX_RETRY_DELAY = 26.7
@@ -49,6 +49,7 @@ def _get_retry_delay(attempt: int) -> float:
     # Cap the exponent for numerical stability: connection retries are unbounded, so `attempt` can grow large.
     backoff = min(_MAX_RETRY_DELAY, _RETRY_DELAY_BASE * (2 ** min(attempt - 1, 10)))
     return random.random() * backoff  # way faster than random.uniform()
+
 
 # ---------------------------------------------------------------------------
 # URL normalisation
@@ -69,9 +70,7 @@ def _normalize_judge_server_url(judge_server_url: str, env_name: str = "") -> st
         judge_server_url = f"http://{judge_server_url}"
     parsed_url = urlparse(judge_server_url)
     if not parsed_url.scheme or not parsed_url.netloc:
-        raise ValueError(
-            "Expected `judge_server_url` like '0.0.0.0:8000' or 'http://0.0.0.0:8000'."
-        )
+        raise ValueError("Expected `judge_server_url` like '0.0.0.0:8000' or 'http://0.0.0.0:8000'.")
     return f"{parsed_url.scheme}://{parsed_url.netloc}"
 
 
@@ -142,10 +141,23 @@ def _build_chat_completions_payload(
     judge_responses_create_params: NeMoGymResponseCreateParamsNonStreaming,
     messages: list[NeMoGymEasyInputMessage],
     judge_model: str,
+    extra_body: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Build the JSON body for a ``/v1/chat/completions`` judge request.
 
     ``max_output_tokens`` (Responses-API naming) is mapped to ``max_tokens``.
+
+    Args:
+        judge_responses_create_params: Base sampling parameters for the judge.
+        messages: Messages to send to the judge.
+        judge_model: Model name sent as ``model``.
+        extra_body: Extra request-body fields (e.g. ``reasoning_effort``,
+            ``chat_template_kwargs``) forwarded as-is to the judge server.
+            Fields built from the other arguments take precedence on key
+            conflicts.
+
+    Returns:
+        The JSON-serialisable request body.
     """
     payload: dict[str, Any] = {
         "model": judge_model,
@@ -158,6 +170,9 @@ def _build_chat_completions_payload(
         payload["top_p"] = judge_responses_create_params.top_p
     if judge_responses_create_params.max_output_tokens is not None:
         payload["max_tokens"] = judge_responses_create_params.max_output_tokens
+    if extra_body is not None:
+        # Same precedence as responses_api_models/vllm_model: explicit fields win over extra_body.
+        payload = extra_body | payload
     return payload
 
 
@@ -203,14 +218,11 @@ def _validate_and_setup_judge_endpoint(
     models_url = f"{normalized}/v1/models"
     models_response = _fetch_models_json_once(models_url)
     if "status_code" in models_response:
-        raise ValueError(
-            f"Could not query '{models_url}'. Query attempt(s) returned: {models_response}"
-        )
+        raise ValueError(f"Could not query '{models_url}'. Query attempt(s) returned: {models_response}")
     available_models = [model.get("id", "") for model in models_response.get("data", [])]
     if judge_model not in available_models:
         raise ValueError(
-            f"Judge model '{judge_model}' NOT found on server '{normalized}'. "
-            f"Available models: {available_models}"
+            f"Judge model '{judge_model}' NOT found on server '{normalized}'. Available models: {available_models}"
         )
     print(
         f"{env_name}: judge_server_url='{normalized}', judge_model='{judge_model}' "
@@ -222,9 +234,9 @@ def _validate_and_setup_judge_endpoint(
 # ---------------------------------------------------------------------------
 # Chat-completions POST with retry
 # ---------------------------------------------------------------------------
-_CONTEXT_LENGTH_ERROR_MESSAGE = (
-    "Please reduce the length of the input prompt or the number of requested output tokens"
-)
+_CONTEXT_LENGTH_ERROR_MESSAGE = "Please reduce the length of the input prompt or the number of requested output tokens"
+
+
 async def _post_chat_completions(
     env_name: str,
     chat_completions_url: str,
@@ -235,10 +247,11 @@ async def _post_chat_completions(
 ) -> dict[str, Any]:
     """POST a chat-completions request to the external judge with retry on 429/5xx.
 
-    ``semaphore`` bounds the number of simultaneous requests; further callers queue
-    without bound. Connection-class failures (disconnects, resets, connection timeouts)
-    are retried indefinitely with jittered exponential backoff, independently of 
-    ``max_retries``, so a slow judge is waited on instead of degraded to default scores.
+    ``semaphore`` bounds the number of simultaneous requests; further callers
+    queue without bound. Connection-class failures (disconnects, resets,
+    connection timeouts) are retried indefinitely with jittered exponential
+    backoff, independently of ``max_retries``, so a slow judge is waited on
+    instead of degraded to default scores.
 
     Returns the parsed JSON response, or ``{}`` on exhaustion.
     """
@@ -252,8 +265,10 @@ async def _post_chat_completions(
     while attempt < max_retries:
         attempt += 1
         try:
-            async with (semaphore if semaphore is not None else nullcontext()):
-                async with client.post(chat_completions_url, json=payload, headers=headers, timeout=timeout, ssl=False) as response:
+            async with semaphore if semaphore is not None else nullcontext():
+                async with client.post(
+                    chat_completions_url, json=payload, headers=headers, timeout=timeout, ssl=False
+                ) as response:
                     if response.status in _RETRYABLE_STATUS_CODES:
                         retry_delay = _get_retry_delay(attempt)
                         body = await response.text()
@@ -294,8 +309,7 @@ async def _post_chat_completions(
 
             if attempt >= max_retries:
                 raise TimeoutError(
-                    f"Judge request timed out after {max_retries} attempts "
-                    f"({_REQUEST_TIMEOUT_SECONDS}s per attempt)"
+                    f"Judge request timed out after {max_retries} attempts ({_REQUEST_TIMEOUT_SECONDS}s per attempt)"
                 ) from exc
 
             await asyncio.sleep(retry_delay)

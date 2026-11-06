@@ -96,6 +96,32 @@ class TestBuildChatCompletionsPayload:
         assert "top_p" not in payload
         assert payload["model"] == "m"
 
+    def test_extra_body_passthrough(self):
+        params = NeMoGymResponseCreateParamsNonStreaming(input=[])
+        msgs = [NeMoGymEasyInputMessage(role="user", content="q")]
+        extra = {"reasoning_effort": "high", "chat_template_kwargs": {"enable_thinking": False}}
+        payload = _build_chat_completions_payload(params, msgs, "m", extra_body=extra)
+        assert payload["reasoning_effort"] == "high"
+        assert payload["chat_template_kwargs"] == {"enable_thinking": False}
+        assert payload["model"] == "m"
+
+    def test_explicit_fields_override_extra_body(self):
+        params = NeMoGymResponseCreateParamsNonStreaming(input=[], temperature=0.3)
+        msgs = [NeMoGymEasyInputMessage(role="user", content="q")]
+        extra = {"model": "other", "temperature": 1.0, "stream": True, "reasoning_effort": "low"}
+        payload = _build_chat_completions_payload(params, msgs, "m", extra_body=extra)
+        assert payload["model"] == "m"
+        assert payload["temperature"] == 0.3
+        assert payload["stream"] is False
+        assert payload["reasoning_effort"] == "low"
+
+    def test_extra_body_none_unchanged(self):
+        params = NeMoGymResponseCreateParamsNonStreaming(input=[], temperature=0.5)
+        msgs = [NeMoGymEasyInputMessage(role="user", content="q")]
+        assert _build_chat_completions_payload(params, msgs, "m", extra_body=None) == _build_chat_completions_payload(
+            params, msgs, "m"
+        )
+
 
 class TestExtractChatCompletionText:
     def test_string_content(self):

@@ -1,20 +1,23 @@
 """
 Math With Judge Environment Resources Server.
 
-This is the production Math With Judge server. The LLM-judge is NOT managed
-by NeMo-Gym — the YAML config must supply a ``judge_server_url`` (a bare
+This is the production Math With Judge server. The LLM-judge is NOT managed by
+NeMo-Gym — the YAML config must supply a ``judge_server_url`` (a bare
 ``host:port``, e.g. ``0.0.0.0:8000``) pointing at an already-running baseline
 ``vllm serve`` endpoint, plus a ``judge_model`` name.
 
 The judge is queried via the OpenAI **Chat Completions** API
-(``{judge_server_url}/v1/chat/completions``) rather than the Responses API, since a
-stock ``vllm serve`` endpoint only exposes the chat-completions surface.
+(``{judge_server_url}/v1/chat/completions``) rather than the Responses API,
+since a stock ``vllm serve`` endpoint only exposes the chat-completions
+surface.
 
 All math-verify / verdict / request / response schema logic is inherited
-unchanged from :class:`resources_servers.math_with_judge_original.app.LibraryJudgeMathResourcesServer`.
+unchanged from
+:class:`resources_servers.math_with_judge_original.app.LibraryJudgeMathResourcesServer`.
 Any dataset that is compatible with ``math_with_judge_simple_agent`` (the
 original, Gym-managed-judge variant under ``math_with_judge_original/``) works
-here unchanged — the ``agent_ref.name`` is the same (``math_with_judge_simple_agent``).
+here unchanged — the ``agent_ref.name`` is the same
+(``math_with_judge_simple_agent``).
 """
 
 from __future__ import annotations
@@ -89,6 +92,10 @@ class LibraryJudgeMathResourcesServerConfig(BaseResourcesServerConfig):
     judge_responses_create_params: NeMoGymResponseCreateParamsNonStreaming = Field(
         description="Base parameters for judge model requests (max_output_tokens maps to max_tokens)"
     )
+    judge_extra_body: Optional[dict[str, Any]] = Field(
+        default=None,
+        description="Extra chat-completions body fields (e.g. reasoning_effort, chat_template_kwargs) merged into every judge request",
+    )
 
     should_use_judge: bool = True
     library_verifier_timeout_seconds: PositiveFloat = 10.0
@@ -101,8 +108,9 @@ def _run_math_verify_with_extraction(
     """Verify the correctness of a generated answer using the math_verify library.
 
     Unlike the original's approach which relies on ``math_verify``'s internal
-    extraction, the answer is first extracted explicitly from the generated text
-    (tries ``\\boxed{}`` first, with multilingual ``Answer:`` as fallback).
+    extraction, the answer is first extracted explicitly from the generated
+    text (tries ``\\boxed{}`` first, with multilingual ``Answer:`` as
+    fallback).
     """
     try:
         # try to manually parse the answer
@@ -173,8 +181,8 @@ class LibraryJudgeMathResourcesServer(_OriginalLibraryJudgeMathResourcesServer):
 
         Overrides the original's :meth:`_generate_judge_evaluation` to call
         ``{judge_server_url}/v1/chat/completions`` instead of the Gym-managed
-        ``/v1/responses`` endpoint. Verdict parsing logic ([[A=B]] / [[A!=B]] label
-        scanning) is identical to the original.
+        ``/v1/responses`` endpoint. Verdict parsing logic ([[A=B]] / [[A!=B]]
+        label scanning) is identical to the original.
         """
         responses_create_params = self.config.judge_responses_create_params.model_copy(deep=True)
 
@@ -187,10 +195,10 @@ class LibraryJudgeMathResourcesServer(_OriginalLibraryJudgeMathResourcesServer):
         ]
         responses_create_params.input = msgs
 
-        payload = _build_chat_completions_payload(responses_create_params, msgs, self.config.judge_model)
-        response_json = await _post_chat_completions(
-            "math_with_judge", self._judge_chat_completions_url, payload
+        payload = _build_chat_completions_payload(
+            responses_create_params, msgs, self.config.judge_model, extra_body=self.config.judge_extra_body
         )
+        response_json = await _post_chat_completions("math_with_judge", self._judge_chat_completions_url, payload)
         judge_text = _extract_chat_completion_text(response_json)
 
         judge_response = _build_judge_response(judge_text, self.config.judge_model)
@@ -219,8 +227,8 @@ class LibraryJudgeMathResourcesServer(_OriginalLibraryJudgeMathResourcesServer):
         """Verify the correctness of a generated answer using the math_verify library.
 
         Overrides the original's naive approach which only relies on
-        ``math_verify``'s internal extraction. Instead, we explicitly extract the
-        answer from the generated text (tries ``\\boxed{}`` first, with
+        ``math_verify``'s internal extraction. Instead, we explicitly extract
+        the answer from the generated text (tries ``\\boxed{}`` first, with
         multilingual ``Answer:`` as fallback) inside the verifier subprocess.
         """
         async with self._library_verifier_semaphore:

@@ -2,15 +2,15 @@
 General QA Environment Resources Server.
 
 This is a standalone (not inherited) QA resource server. It verifies model
-responses against expected answers using three deterministic verifiers (exact
-match, math-verify, F1) plus an optional externally-hosted LLM judge.
+responses against expected answers using three deterministic verifiers
+(exact match, math-verify, F1) plus an optional externally-hosted LLM judge.
 
 The LLM-judge is NOT managed by NeMo-Gym — the YAML config must supply a
 ``judge_server_url`` (host:port, e.g. ``0.0.0.0:8000``) pointing at an
 already-running ``vllm serve`` endpoint, plus a ``judge_model`` name.
 
-The judge is queried via ``{judge_server_url}/v1/chat/completions`` (native
-vLLM), not the Responses API. The judge is only invoked when
+The judge is queried via ``{judge_server_url}/v1/chat/completions``
+(native vLLM), not the Responses API. The judge is only invoked when
 ``should_use_judge=true`` AND deterministic reward <= 0.5 (mixed-rewards
 strategy).
 """
@@ -104,6 +104,10 @@ class GeneralQAResourcesServerConfig(BaseResourcesServerConfig):
 
     judge_responses_create_params: NeMoGymResponseCreateParamsNonStreaming = Field(
         description="Base parameters for judge model requests (max_output_tokens maps to max_tokens)"
+    )
+    judge_extra_body: Optional[dict[str, Any]] = Field(
+        default=None,
+        description="Extra chat-completions body fields (e.g. reasoning_effort, chat_template_kwargs) merged into every judge request",
     )
 
     should_use_judge: bool = False
@@ -543,7 +547,9 @@ The question does not request a specific answer style or format. The correctness
         ]
         responses_create_params.input = msgs
 
-        payload = _build_chat_completions_payload(responses_create_params, msgs, self.config.judge_model)
+        payload = _build_chat_completions_payload(
+            responses_create_params, msgs, self.config.judge_model, extra_body=self.config.judge_extra_body
+        )
         response_json = await _post_chat_completions("general_qa", self._judge_chat_completions_url, payload)
         judge_text = _extract_chat_completion_text(response_json)
 
