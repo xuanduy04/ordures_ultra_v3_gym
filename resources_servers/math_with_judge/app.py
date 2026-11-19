@@ -22,12 +22,8 @@ here unchanged — the ``agent_ref.name`` is the same
 
 from __future__ import annotations
 
-import multiprocessing as mp
 from typing import Any, List, Optional
 
-from math_verify import math_metric
-from math_verify.errors import TimeoutException
-from math_verify.parser import ExprExtractionConfig, LatexExtractionConfig
 from pydantic import Field, PositiveFloat, PositiveInt
 
 from nemo_gym.base_resources_server import BaseResourcesServerConfig
@@ -43,7 +39,6 @@ from resources_servers.math_with_judge_original.app import (
     JudgeEvaluation,
     LibraryJudgeMathResourcesServer as _OriginalLibraryJudgeMathResourcesServer,
 )
-from resources_servers.utils_qa.extract_answer import extract_answer
 from resources_servers.utils_outsource.judge_server_url_utils import (
     _build_chat_completions_payload,
     _extract_chat_completion_text,
@@ -100,57 +95,6 @@ class LibraryJudgeMathResourcesServerConfig(BaseResourcesServerConfig):
     should_use_judge: bool = True
     library_verifier_timeout_seconds: PositiveFloat = 10.0
     library_verifier_max_concurrency: PositiveInt = 32
-
-
-def _run_math_verify_with_extraction(
-    library_verifier: Any, expected_answer: str, generated_answer: str
-) -> tuple[float, Optional[str]]:
-    """Verify the correctness of a generated answer using the math_verify library.
-
-    Unlike the original's approach which relies on ``math_verify``'s internal
-    extraction, the answer is first extracted explicitly from the generated
-    text (tries ``\\boxed{}`` first, with multilingual ``Answer:`` as
-    fallback).
-    """
-    try:
-        # try to manually parse the answer
-        extracted = extract_answer(generated_answer)
-
-        if not extracted:
-            # default to generated_answer
-            extracted = generated_answer
-
-        stripped = LibraryJudgeMathResourcesServer._strip_math_delimiters(expected_answer)
-        ground_truth_parsable = "\\boxed{" + stripped + "}"
-
-        with LibraryJudgeMathResourcesServer._mute_output():
-            ret_score, _ = library_verifier([ground_truth_parsable], [extracted])
-
-        return float(ret_score), extracted
-
-    # It's possible to emit a TimeoutException and that wouldn't be caught since
-    # it actually subclasses from BaseException and math-verify itself does not
-    # catch it.
-    except (Exception, TimeoutException):
-        return 0.0, None
-
-
-def _run_math_verify_with_extraction_in_subprocess(
-    expected_answer: str, generated_answer: str, result_connection: Any
-) -> None:
-    # Keep math_verify construction inside the child process. A wedged SymPy call
-    # can then be killed by terminating this process without poisoning the server.
-    library_verifier = math_metric(
-        gold_extraction_target=(LatexExtractionConfig(),),
-        pred_extraction_target=(
-            ExprExtractionConfig(),
-            LatexExtractionConfig(),
-        ),
-    )
-    try:
-        result_connection.send(_run_math_verify_with_extraction(library_verifier, expected_answer, generated_answer))
-    finally:
-        result_connection.close()
 
 
 class LibraryJudgeMathResourcesServer(_OriginalLibraryJudgeMathResourcesServer):
@@ -220,34 +164,6 @@ class LibraryJudgeMathResourcesServer(_OriginalLibraryJudgeMathResourcesServer):
                 return True, judge_evaluation
             else:
                 return False, judge_evaluation
-
-    async def _verify_answer_with_library_async(
-        self, expected_answer: str, generated_answer: str
-    ) -> tuple[float, Optional[str]]:
-        """Verify the correctness of a generated answer using the math_verify library.
-
-        Overrides the original's naive approach which only relies on
-        ``math_verify``'s internal extraction. Instead, we explicitly extract
-        the answer from the generated text (tries ``\\boxed{}`` first, with
-        multilingual ``Answer:`` as fallback) inside the verifier subprocess.
-        """
-        async with self._library_verifier_semaphore:
-            # The production rollout workers run on Linux. Pin fork so the
-            # verifier child is cheap to start and can be killed independently
-            # if SymPy wedges.
-            ctx = mp.get_context("fork")
-            result_connection, child_connection = ctx.Pipe(duplex=False)
-            process = ctx.Process(
-                target=_run_math_verify_with_extraction_in_subprocess,
-                args=(expected_answer, generated_answer, child_connection),
-            )
-            process.start()
-            child_connection.close()
-            return await self._wait_for_library_verifier_process(
-                process,
-                result_connection,
-                self.config.library_verifier_timeout_seconds,
-            )
 
 
 if __name__ == "__main__":

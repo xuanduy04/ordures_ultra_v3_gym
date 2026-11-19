@@ -19,7 +19,7 @@ which is the original Gym-managed-judge variant.
 | Judge protocol | `/v1/responses` (Responses API) via `ServerClient` | `/v1/chat/completions` (native vLLM) via direct HTTP |
 | Config fields | `judge_model_server` (a `ModelServerRef`) | `judge_server_url` + `judge_model` (both mandated, no defaults) |
 | Init validation | (none — Gym spins up the judge) | `judge_server_url` normalized + `judge_model` checked against `/v1/models` |
-| Library answer extraction | `math_verify` internal extraction (`grader.verify` selection) | Explicit `\boxed{}` first, multilingual `Answer:` fallback (`utils_qa.extract_answer`), still scored by `math_verify` in the verifier subprocess |
+| Library answer extraction | `math_verify` internal extraction (`grader.verify` selection) | **Identical** (inherited from `math_with_judge_original`) |
 | Math-verify / verdict / data schema | — | **Identical** (inherited from `math_with_judge_original`) |
 
 Everything else — `[[A=B]]`/`[[A!=B]]` verdict extraction, `should_use_judge` gate
@@ -88,7 +88,7 @@ cd 3rdparty/Gym-workspace/Gym && conda run -n trashrepo_ultra_v3 env PYTHONPATH=
 Tests cover (no network required):
 - minimal `NeMoGymResponse` construction wrapping chat-completions output
 - config required-field enforcement (`judge_server_url` / `judge_model` / `judge_responses_create_params`)
-- the explicit boxed / answer-colon extraction library verifier (sync and subprocess paths)
+- the inherited `math_verify` library verifier (sync and subprocess paths), including non-numeric answers (tuples, intervals, expressions, text)
 - math delimiter stripping
 - `[[A=B]]` / `[[A!=B]]` verdict scanning on chat-completions judge text
 
