@@ -10,8 +10,8 @@ from resources_servers.math_with_judge.app import (
     LibraryJudgeMathResourcesServer,
     LibraryJudgeMathResourcesServerConfig,
     _build_judge_response,
-    _run_math_verify_with_extraction,
 )
+from resources_servers.math_with_judge_original.app import _run_math_verify
 
 
 def _make_config(**overrides):
@@ -99,33 +99,37 @@ class TestConfigRequiredFields:
 class TestLibraryVerifier:
     """Library verifier uses explicit boxed / answer-colon extraction before math_verify comparison."""
 
+    # The explicit-extraction override was removed: the library verifier is now the one inherited unchanged from
+    # math_with_judge_original (math_verify's internal extraction), so these cases run against _run_math_verify.
+
     def test_boxed(self):
         verifier = _make_library_verifier()
-        reward, extracted = _run_math_verify_with_extraction(verifier, "4", "2 + 2 = \\boxed{4}")
+        reward, extracted = _run_math_verify(verifier, "4", "2 + 2 = \\boxed{4}")
         assert reward == pytest.approx(1.0)
         assert extracted == "4"
 
     def test_boxed_latex(self):
         verifier = _make_library_verifier()
-        reward, extracted = _run_math_verify_with_extraction(verifier, "\\boxed{12}", "3 * 4 = \\boxed{12}")
+        reward, extracted = _run_math_verify(verifier, "\\boxed{12}", "3 * 4 = \\boxed{12}")
         assert reward == pytest.approx(1.0)
         assert extracted == "12"
 
     def test_boxed_fraction(self):
         verifier = _make_library_verifier()
-        reward, extracted = _run_math_verify_with_extraction(verifier, "4.0", "2 + 2 = \\boxed{\\frac{8}{2}}")
+        reward, extracted = _run_math_verify(verifier, "4.0", "2 + 2 = \\boxed{\\frac{8}{2}}")
         assert reward == pytest.approx(1.0)
-        assert extracted == "\\frac{8}{2}"
+        # math_verify returns its parsed form of the prediction, not the raw LaTeX.
+        assert extracted == "4"
 
     def test_answer_colon(self):
         verifier = _make_library_verifier()
-        reward, extracted = _run_math_verify_with_extraction(verifier, "4", "Answer: 4")
+        reward, extracted = _run_math_verify(verifier, "4", "Answer: 4")
         assert reward == pytest.approx(1.0)
         assert extracted == "4"
 
     def test_boxed_priority(self):
         verifier = _make_library_verifier()
-        reward, extracted = _run_math_verify_with_extraction(verifier, "3", "Answer: 5 \\boxed{3}")
+        reward, extracted = _run_math_verify(verifier, "3", "Answer: 5 \\boxed{3}")
         assert reward == pytest.approx(1.0)
         assert extracted == "3"
 
@@ -133,28 +137,59 @@ class TestLibraryVerifier:
         verifier = _make_library_verifier()
         # No boxed and no answer_colon marker — extraction fails, falls back to
         # generated_answer, which does not match expected.
-        reward, extracted = _run_math_verify_with_extraction(verifier, "\\boxed{12}", "3 * 4 = 13")
+        # With the inherited verifier, math_verify extracts the last plain expression ("13") instead.
+        reward, extracted = _run_math_verify(verifier, "\\boxed{12}", "3 * 4 = 13")
         assert reward == pytest.approx(0.0)
-        assert extracted == "3 * 4 = 13"
+        assert extracted == "13"
 
     def test_empty(self):
         verifier = _make_library_verifier()
         # Empty strings — math_verify raises on empty box, caught by except path.
-        reward, extracted = _run_math_verify_with_extraction(verifier, "", "")
+        reward, extracted = _run_math_verify(verifier, "", "")
         assert reward == pytest.approx(0.0)
         assert extracted is None
 
     def test_exact(self):
         verifier = _make_library_verifier()
-        reward, extracted = _run_math_verify_with_extraction(verifier, "3", "\\boxed{3}")
+        reward, extracted = _run_math_verify(verifier, "3", "\\boxed{3}")
         assert reward == pytest.approx(1.0)
         assert extracted == "3"
 
     def test_mismatch(self):
         verifier = _make_library_verifier()
-        reward, extracted = _run_math_verify_with_extraction(verifier, "\\boxed{5}", "10 - 5 = \\boxed{4}")
+        reward, extracted = _run_math_verify(verifier, "\\boxed{5}", "10 - 5 = \\boxed{4}")
         assert reward == pytest.approx(0.0)
         assert extracted == "4"
+
+    @pytest.mark.parametrize(
+        "expected_answer, boxed_answer",
+        [
+            ("(3, -1)", "(3,-1)"),
+            ("x^2 + 2x + 1", "(x+1)^2"),
+            ("2\\sqrt{3}", "\\sqrt{12}"),
+            ("[2,5)", "[2,5)"),
+            ("\\text{even}", "\\text{even}"),
+        ],
+    )
+    def test_non_numeric_equivalent(self, expected_answer, boxed_answer):
+        # Regression: the removed override passed the bare boxed content to math_verify, whose LaTeX parser then
+        # did not fire, so these equivalent answers scored 0.
+        verifier = _make_library_verifier()
+        reward, _ = _run_math_verify(verifier, expected_answer, f"so $\\boxed{{{boxed_answer}}}$")
+        assert reward == pytest.approx(1.0)
+
+    @pytest.mark.parametrize(
+        "expected_answer, boxed_answer",
+        [
+            ("(3, -1)", "(3, 1)"),
+            ("[2,5)", "[2,5]"),
+            ("4+3i", "4-3i"),
+        ],
+    )
+    def test_non_numeric_different(self, expected_answer, boxed_answer):
+        verifier = _make_library_verifier()
+        reward, _ = _run_math_verify(verifier, expected_answer, f"so $\\boxed{{{boxed_answer}}}$")
+        assert reward == pytest.approx(0.0)
 
     def test_strip_math_delimiters(self):
         assert LibraryJudgeMathResourcesServer._strip_math_delimiters("\\(x + 1\\)") == "x + 1"
@@ -188,7 +223,13 @@ class TestLibraryVerifierAsync:
         server = self._make_server()
         reward, extracted = await server._verify_answer_with_library_async("\\boxed{12}", "3 * 4 = 13")
         assert reward == pytest.approx(0.0)
-        assert extracted == "3 * 4 = 13"
+        assert extracted == "13"
+
+    async def test_non_numeric_equivalent(self):
+        server = self._make_server()
+        reward, extracted = await server._verify_answer_with_library_async("(3, -1)", "so $\\boxed{(3,-1)}$")
+        assert reward == pytest.approx(1.0)
+        assert extracted == "(3, -1)"
 
     async def test_empty(self):
         server = self._make_server()
