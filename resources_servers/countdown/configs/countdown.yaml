@@ -1,0 +1,25 @@
+countdown:
+  resources_servers:
+    countdown:
+      entrypoint: app.py
+      domain: other
+      verified: false
+      description: Countdown arithmetic task with a rule-based verifier (from TinyZero)
+      value: Improve arithmetic reasoning capabilities
+      format_score: 0.1
+      score: 1.0
+      strict_ops: false
+countdown_simple_agent:
+  responses_api_agents:
+    simple_agent:
+      entrypoint: app.py
+      resources_server:
+        type: resources_servers
+        name: countdown
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      datasets:
+      - name: example
+        type: example
+        jsonl_fpath: resources_servers/countdown/data/example.jsonl

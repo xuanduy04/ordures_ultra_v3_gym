@@ -1,0 +1,24 @@
+knight_and_knave:
+  resources_servers:
+    knight_and_knave:
+      entrypoint: app.py
+      domain: other
+      verified: false
+      description: Knights and Knaves logic puzzles with a rule-based verifier
+      value: Improve logical reasoning capabilities
+      incorrect_score: 0.0
+      score: 1.0
+knight_and_knave_simple_agent:
+  responses_api_agents:
+    simple_agent:
+      entrypoint: app.py
+      resources_server:
+        type: resources_servers
+        name: knight_and_knave
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      datasets:
+      - name: example
+        type: example
+        jsonl_fpath: resources_servers/knight_and_knave/data/example.jsonl
