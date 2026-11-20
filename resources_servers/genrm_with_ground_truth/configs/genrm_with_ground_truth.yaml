@@ -1,0 +1,73 @@
+# ============================================================================
+# GenRM With Ground Truth Environment Configuration
+# ============================================================================
+# The GenRM model judge is NOT managed by NeMo-Gym. The YAML MUST supply:
+#   - genrm_server_url : host:port of an already-running GenRM model endpoint
+#                        (e.g. 0.0.0.0:8000). No default is provided.
+#   - genrm_model      : GenRM model name served at genrm_server_url.
+#
+# Each sample MUST carry a `ground_truth` field. It is sent as response_1 and
+# the policy's answer as response_2.
+#
+# Expected GenRM output format (JSON):
+# {
+#     "score_1": <1-5>,  # Individual helpfulness score for response 1
+#     "score_2": <1-5>,  # Individual helpfulness score for response 2
+#     "ranking": <1-6>   # 1=R1 much better, 6=R2 much better
+# }
+#
+# reward = score_2 + ranking (range [2, 11])
+# ============================================================================
+
+genrm_with_ground_truth_resources_server:
+  resources_servers:
+    genrm_with_ground_truth:
+      entrypoint: app.py
+
+      # MANDATED: externally-hosted GenRM model endpoint (no default).
+      genrm_server_url: ""
+      # MANDATED: GenRM model name served at genrm_server_url (no default).
+      genrm_model: ""
+
+      # Generation params for GenRM calls
+      genrm_responses_create_params:
+        input: []
+        max_output_tokens: 65536
+        temperature: 0.6
+        top_p: 0.95
+
+      # Max simultaneous in-flight GenRM HTTP requests from this server process.
+      # 0 or negative = unlimited.
+      genrm_endpoint_max_concurrency: 512
+
+      # Principle-based comparison
+      use_principle: false
+
+      # Default scores when parsing fails
+      default_score: 3.0
+      default_ranking: 3.5
+
+      # Parse retry configuration
+      genrm_parse_retries: 3
+      genrm_parse_retry_sleep_s: 0.2
+
+      # Server metadata
+      domain: rlhf
+      verified: false
+      description: GenRM comparison of the policy answer against a ground-truth answer
+      value: Reward helpful answers that are preferred over the ground truth
+
+genrm_with_ground_truth_simple_agent:
+  responses_api_agents:
+    simple_agent:
+      entrypoint: app.py
+      resources_server:
+        type: resources_servers
+        name: genrm_with_ground_truth_resources_server
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      datasets:
+      - name: example
+        type: example
+        jsonl_fpath: resources_servers/genrm_with_ground_truth/data/example.jsonl
