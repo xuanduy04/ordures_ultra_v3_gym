@@ -1,5 +1,3 @@
-
-
 from asyncio import Semaphore
 from time import time
 from typing import Any, Dict, List, Optional, Union
@@ -31,6 +29,7 @@ class CompCodingResourcesServerConfig(BaseResourcesServerConfig):
     unit_test_timeout_secs: int
     debug: bool
     reasoning_format_penalty: float = 0.0
+    binary_rewards: bool = False
 
 
 # ----------------------------
@@ -196,14 +195,15 @@ class CompCodingResourcesServer(SimpleResourcesServer):
             unit_tests_time_taken = time() - start_time
 
         has_violation = self._has_reasoning_format_violation(body.response)
+        if self.config.binary_rewards:
+            reward = 1.0 if all(r == True for r in result) else 0.0
+        else:
+            num_passed = float(sum(1.0 for r in result if r == True))
+            reward = num_passed / len(result) if len(result) > 0 else 0.0
 
         return CompCodingVerifyResponse(
             **body.model_dump(),
-            reward=(
-                self.config.reasoning_format_penalty
-                if has_violation
-                else (1.0 if all(r == True for r in result) else 0.0)
-            ),
+            reward=self.config.reasoning_format_penalty if has_violation else reward,
             extracted_model_output=model_out,
             extracted_model_code=code,
             result=result,
