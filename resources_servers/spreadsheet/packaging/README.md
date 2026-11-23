@@ -2,10 +2,68 @@
 
 Development branch: `tungks/feat/tool/spreadsheet-rl`.
 
+Start with [SETUP.md](../SETUP.md) for the service/trainer split and
+the runtime reproducibility contract. `runtime.lock.json` pins the published
+dependency artifact. `modal_reproduce.py` checks two independent offline Ubuntu
+installs, sandbox reconstruction, package/content fingerprints and real canaries;
+the worker logic is in `verify_runtime.py`. No runtime is installed on the Mac.
+The qualified 2026-11-17 repair is the default lock; its two independent builds
+produced identical archives, and two further clean offline installs passed.
+See [reproducibility-20261117.json](reproducibility-20261117.json) for evidence.
+`runtime.legacy.lock.json` retains the original four-file glibc drift;
+`runtime.candidate.lock.json` preserves the exact pre-promotion test input.
+
 Terminal commands should download an immutable release, verify its checksum, and
 invoke these files with node-specific paths. Keep conversion, contract checks,
 source installation and YAML edits in the versioned scripts. Operator-specific
 paths and private keys stay outside public release artifacts.
+
+## Audit rejected tasks on Modal CPU
+
+`modal_audit_dataset.py` installs the pinned dependency artifact once into a
+cached image, downloads/checksums the pinned public data on Modal, and audits
+8,647 tasks with up to **eight independent CPU workers**. Each 50-task batch
+has a source/data/baseline identity and a hashed completion checkpoint. Resume
+by passing the same `--run-id`, full clean `--source-commit`, and batch size.
+
+```bash
+modal run --profile PROFILE resources_servers/spreadsheet/packaging/modal_audit_dataset.py \
+  --source-commit "$(git rev-parse HEAD)" --output-dir /path/to/new/audit-results
+```
+
+The baseline reader is loaded from the original source inside the locked bundle.
+The new scorer streams values, supports up to 4,096 metadata ranges and a total
+of two million answer cells; per-range and public tool limits remain bounded.
+Original exact/normalized cell equality is preserved, including the two-decimal
+rounding boundary. Numeric precision candidates are diagnostic labels only.
+
+Each task receives two independent oracle recalculations. Strict recoveries
+also undergo a temporary native-tool add/write/remove-sheet and recalc roundtrip.
+`recovered_scoring_only` tasks are withheld from recovered training rows.
+`recovered.manifest.jsonl` and `recovered.{train,test}.jsonl` contain only strict,
+tool-ready recoveries. This does not rewrite the active dataset or training YAML.
+The original node's historical ID membership must be checked separately if its
+per-task report is unavailable; matching a total alone does not establish it.
+
+`summary.json` contains counts, provenance and output hashes. Detailed per-cell
+reports and formulas stay in the private Modal Volume and local audit directory,
+outside public source bundles and policy observations. The worker implementation
+is `audit_rejections.py`; `--limit` is available for partial diagnostic runs.
+
+`audit_selection.py --tasks TASKS.jsonl --rejected rejected.audit.jsonl
+--summary summary.json --output NEW_COVERAGE.json` reports retention by split,
+task source and answer-range count. It validates ID uniqueness and audit totals.
+Zero regressions establishes preservation on the observed baseline pass cohort;
+it does not establish absence of selection bias. Keep strict and any future
+LibreOffice compatibility scores separate. Calibrate a new value policy on train
+only and freeze it before held-out evaluation; never tune task-specific rules
+against oracle answers. The current audit does not relax numeric equality.
+
+`modal_inspect_dependencies.py` reads raw original/recalculated OOXML using the
+already-built runtime image selected by `SPREADSHEET_AUDIT_BASE_IMAGE`. It records
+date/random-function hints, external-link parts and invalid filter metadata,
+without normalizing the oracle or silently removing workbook features. These
+private diagnostics distinguish volatile dependencies from engine differences.
 
 | Entrypoint | Required inputs | Result |
 | --- | --- | --- |
@@ -17,7 +75,7 @@ paths and private keys stay outside public release artifacts.
 | `prepare_cached_frontends.py` | `--venv-root`, `--expected-hostname`, `--receipt` | Copy the existing `math_with_judge` and `simple_agent` caches for the two new frontends; no installs or venv aliases |
 | `prepare_project_runtime.sh` | `TRAINER_ROOT NLTK_DATA`, then `--base-config`, `--runtime-root`, `--qualified-dir`, `--output-dir`, `--private-config`, `--expected-hostname` | Prepare project-local caches and an inherited YAML; verify existing integration/data without modifying their files |
 | `check_live_service.py` | `--private-config`, `--dataset`, `--manifest`, `--data-root`, fresh `--output-dir`, `--expected-hostname` | Trusted HTTP canary covering all 12 tools, isolation, recalc, replay and reward; separate from model rollouts |
-| `smoke_training.sh` | `TRAINER_ROOT NLTK_DATA`, then `--base-config`, `--run-dir`, short fresh `--ray-root`, `--private-config`, `--expected-hostname` | Two optimizer steps with two prompts and two generations each; existing weights/actor venvs, separate logs, disabled checkpoints and external logging |
+| `smoke_training.sh` | `TRAINER_ROOT NLTK_DATA`, then `--base-config`, `--run-dir`, short fresh `--ipc-root`, `--private-config`, `--expected-hostname` | Two optimizer steps with two prompts and two generations each; existing weights/actor venvs, separate logs, disabled checkpoints and external logging |
 | `build_source_bundle.py` | Clean source checkout; `--output-dir` outside it | Small source archive and checksum, pinned to the exact Git commit |
 
 Conversion, source installation and source packaging use only Python's standard
@@ -42,6 +100,28 @@ conversion reuses existing files only when the hashes match.
 
 Only `data.train` is changed by the converter. Existing model settings, algorithm
 parameters, validation configuration and launcher remain byte-for-byte intact.
+
+## Convert Spreadsheet prompts for Qwen3-Coder
+
+To test Spreadsheet with a shared `qwen3_coder` parser, run the prompt converter
+next to the existing qualified dataset:
+
+```bash
+python3 convert_coder_prompts.py \
+  --input-dir /path/to/prepared/nemo_gym \
+  --manifest /path/to/prepared/libreoffice/manifest.qualified.jsonl \
+  --output-dir /path/to/prepared/nemo_gym_qwen3_coder_v2
+```
+
+The converter adds the Coder call syntax to the Spreadsheet system message and
+advertises `fill_formula.end_row` as an optional integer with its bounds at the
+property level. Callers can omit it. This lets legacy Coder parsers read the type
+without inspecting nullable `anyOf` branches. The converter keeps all other row
+fields and checks both splits against the original manifest before writing a
+separate pair of JSONL files with checksum receipts.
+This step requires only Python on CPU. A rollout smoke must confirm that the
+checkpoint follows the example and that the server returns structured
+`function_call` and `function_call_output` entries.
 
 ## Gym source installation
 

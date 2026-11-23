@@ -6,6 +6,8 @@ isolated Python. The service runs in an existing **Ubuntu 24.04 x86_64 container
 the training container calls it through its reachable IP/port. There is no nested
 Docker, Kubernetes, Apptainer, model, GPU, or `verl` dependency in the service.
 
+The setup/runbook is in [SETUP.md](SETUP.md), including the pinned-runtime
+reproduction test and the distinction between smoke and full training readiness.
 The implementation plan and invariants are in [DESIGN.md](DESIGN.md). The API
 contracts are in [schemas.py](schemas.py). This is a **LibreOffice backend**, not
 a claim of reproducing Microsoft Excel benchmark scores.
@@ -13,12 +15,20 @@ a claim of reproducing Microsoft Excel benchmark scores.
 ## Qualified public bundle
 
 The [public HF runtime](https://huggingface.co/datasets/codemaivanngu/spreadsheet-gym-libreoffice-runtime)
-contains a 288,364,234-byte archive built from code commit
-`9dcc7e1aef517af8da352fcb7a56cf5baba28e1d`. Its immutable artifact revision is
-`a4bb83d536bc3512ffa7e60bac4dcd6b0461c3d1` and SHA-256 is
-`a7eee8c396f6d1ee56ac8c2748a8d1bfdaacc3b7ae47a9a63998b718ade982e9`.
+contains the qualified 288,223,870-byte `-repro1.tar.gz` archive. Its immutable
+revision is `36f3a2cdd2506ca61979d90998d7df41d5845014` and SHA-256 is
+`151ae1135a44aa8d8f993a9bfc22306bbb0e9c0283c7c6e31de8405f94fb15d4`.
+The service source remains `9dcc7e1aef517af8da352fcb7a56cf5baba28e1d`;
+repair commit `9e683cb302f7454b3474bca4e436dbecdff0b576` aligns four sandbox
+glibc/loader files with the artifact's own offline Debian packages. Two isolated
+builds produced identical archives, then two more clean offline installs each
+passed 34 tests with two expected skips and identical runtime/root/behavior
+fingerprints. See [runtime.lock.json](packaging/runtime.lock.json) and
+[the reproduction receipt](packaging/reproducibility-20261117.json).
+The original archive remains available under `runtime.legacy.lock.json`; it
+passed functional tests but differed on those four files during strict rebuild.
 
-Qualification passed 29 local tests, 34 Linux CPU tests, and the same 34 tests
+Initial artifact qualification passed 29 local tests, 34 Linux CPU tests, and the same 34 tests
 after offline installation in a clean Ubuntu container. The Linux runs skip
 Gym-specific tests (covered locally) and the non-root rejection case; local runs
 skip the real Linux/XLSX dependencies. Ruff and shell syntax checks passed.
@@ -28,19 +38,25 @@ The operator's pinned dataset run checked 8,647 tasks and kept 7,684 under this
 scorer: 5,282 train and 2,402 test rows. The exclusions include observed cached
 value differences and parser/reader limits; they do not all establish LibreOffice
 calculation defects. The gate checks existing oracle values, not arbitrary future
-policy formulas. Live model rollout, training throughput, and Excel reward
-equivalence remain unverified.
+policy formulas. A later NeMo Gym smoke completed two training steps and eight
+model rollouts with twelve tool calls and both reward classes; see [SETUP.md](SETUP.md).
+Full-scale training throughput and Excel reward equivalence remain unverified.
+The current integration suite on 2026-11-17 passed 104 tests with seven expected
+skips using the existing development runtime. Linux/LibreOffice checks above ran
+on Modal CPU; no service dependencies were installed on the Mac.
+The [full dataset audit](DATASET_AUDIT.md) records strict recoveries, remaining
+reader/engine errors and measured compatibility-selection coverage.
 
 Run these commands **on the service node**, using its configured company proxy:
 download and extract the runtime on node-local executable storage. Dataset files
 and prepared manifests may remain on shared storage.
 
 ```bash
-SPREADSHEET_BUNDLE_BASE=https://huggingface.co/datasets/codemaivanngu/spreadsheet-gym-libreoffice-runtime/resolve/a4bb83d536bc3512ffa7e60bac4dcd6b0461c3d1
-curl --fail --location --retry 3 "$SPREADSHEET_BUNDLE_BASE/SHA256SUMS" -o SHA256SUMS
-curl --fail --location --retry 3 "$SPREADSHEET_BUNDLE_BASE/spreadsheet-gym-ubuntu24.04-x86_64.tar.gz" -o spreadsheet-gym-ubuntu24.04-x86_64.tar.gz
-sha256sum -c SHA256SUMS
-tar -xzf spreadsheet-gym-ubuntu24.04-x86_64.tar.gz
+SPREADSHEET_BUNDLE_BASE=https://huggingface.co/datasets/codemaivanngu/spreadsheet-gym-libreoffice-runtime/resolve/36f3a2cdd2506ca61979d90998d7df41d5845014
+curl --fail --location --retry 3 "$SPREADSHEET_BUNDLE_BASE/SHA256SUMS-repro1" -o SHA256SUMS-repro1
+curl --fail --location --retry 3 "$SPREADSHEET_BUNDLE_BASE/spreadsheet-gym-ubuntu24.04-x86_64-repro1.tar.gz" -o spreadsheet-gym-ubuntu24.04-x86_64-repro1.tar.gz
+sha256sum -c SHA256SUMS-repro1
+tar -xzf spreadsheet-gym-ubuntu24.04-x86_64-repro1.tar.gz
 cd spreadsheet-gym-ubuntu24.04-x86_64
 bash install_offline.sh
 ```
@@ -66,6 +82,18 @@ The adapter integrates with `SimpleResourcesServer`; a small spreadsheet agent
 preserves the `simple_agent` Responses loop, cookies, token IDs, and logprobs.
 It adds stable tool-call IDs in HTTP headers, an allowlist of tools, inference
 execution claims, and best-effort close. The existing calculator is unchanged.
+
+Spreadsheet response admission is bounded by `max_pending_responses: 4000`
+(waiting plus running inference executions). `max_concurrent_responses: 32`
+limits active executions without rejecting a normal 1,008-rollout collection.
+Completed responses have a separate 4,000-entry, 300-second retry cache; its TTL
+starts at completion, and completed entries do not consume pending queue slots.
+Retries share the original task even if their HTTP caller disconnects. The
+service's `max_pending: 4000` separately bounds queued plus running workbook
+operations; its worker count and LibreOffice pool size are unchanged. These are
+admission limits, not a claim of 4,000 simultaneous LibreOffice executions.
+Existing service JSON must explicitly receive the new `max_pending` value on
+deployment. No NeMo RL/VAI source or training shell changes are required.
 
 ## Tool interface and supported semantics
 
@@ -150,11 +178,11 @@ an offline wheelhouse, the minimal Python root, source, checksums, licenses, and
 qualification receipt. No dataset, oracle, credential, or company file is included.
 
 On the service node, after downloading the archive and its **same-revision**
-SHA256SUMS through the company proxy:
+`SHA256SUMS-repro1` through the company proxy:
 
 ```bash
-sha256sum -c SHA256SUMS
-tar -xzf spreadsheet-gym-ubuntu24.04-x86_64.tar.gz
+sha256sum -c SHA256SUMS-repro1
+tar -xzf spreadsheet-gym-ubuntu24.04-x86_64-repro1.tar.gz
 cd spreadsheet-gym-ubuntu24.04-x86_64
 bash install_offline.sh
 ```

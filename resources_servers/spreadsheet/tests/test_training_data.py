@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from resources_servers.spreadsheet.packaging import convert_training_data as converter
+from resources_servers.spreadsheet.packaging.convert_coder_prompts import FORMAT_PROMPT, convert as convert_coder
 from resources_servers.spreadsheet.schemas import tool_schemas
 
 
@@ -29,6 +30,41 @@ def test_conversion_adds_agent_routing_and_preserves_the_entire_request():
 
     parsed = NeMoGymResponseCreateParamsNonStreaming.model_validate(result["responses_create_params"])
     assert len(parsed.tools) == 12
+
+
+def test_coder_prompt_conversion_preserves_the_qualified_rows(tmp_path):
+    manifest = tmp_path / "qualified.jsonl"
+    manifest_rows = []
+    for split in ("train", "test"):
+        original = converter.convert_row(row(split), "spreadsheet_agent")
+        original["responses_create_params"]["input"].insert(0, {"role": "system", "content": "Original system prompt"})
+        (tmp_path / f"{split}.jsonl").write_text(json.dumps(original) + "\n")
+        manifest_rows.append({
+            "task_id": split, "dataset_revision": "pinned-revision", "libreoffice_qualified": True,
+        })
+    manifest.write_text("".join(json.dumps(item) + "\n" for item in manifest_rows))
+    output = tmp_path / "coder"
+    receipt = convert_coder(tmp_path, manifest, output)
+    for split in ("train", "test"):
+        original = json.loads((tmp_path / f"{split}.jsonl").read_text())
+        converted = json.loads((output / f"{split}.jsonl").read_text())
+        system = converted["responses_create_params"]["input"][0]
+        assert system["content"] == "Original system prompt\n\n" + FORMAT_PROMPT
+        system["content"] = "Original system prompt"
+        original_fill = next(tool for tool in original["responses_create_params"]["tools"] if tool["name"] == "fill_formula")
+        converted_fill = next(tool for tool in converted["responses_create_params"]["tools"] if tool["name"] == "fill_formula")
+        assert "end_row" not in converted_fill["parameters"]["required"]
+        original_properties = original_fill["parameters"]["properties"]
+        converted_properties = converted_fill["parameters"]["properties"]
+        assert converted_properties["end_row"] == {
+            "type": "integer", "minimum": 1, "maximum": 1048576, "title": "End Row",
+        }
+        assert original_properties["end_row"]["default"] is None
+        converted_properties["end_row"] = original_properties["end_row"]
+        assert converted == original
+        assert receipt["splits"][split]["rows"] == 1
+    with pytest.raises(FileExistsError):
+        convert_coder(tmp_path, manifest, output)
 
 
 @pytest.mark.parametrize(
