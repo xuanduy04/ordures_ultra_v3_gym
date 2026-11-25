@@ -110,13 +110,18 @@ next to the existing qualified dataset:
 python3 convert_coder_prompts.py \
   --input-dir /path/to/prepared/nemo_gym \
   --manifest /path/to/prepared/libreoffice/manifest.qualified.jsonl \
-  --output-dir /path/to/prepared/nemo_gym_qwen3_coder_v2
+  --output-dir /path/to/prepared/nemo_gym_qwen3_coder_v3
 ```
 
 The converter adds the Coder call syntax to the Spreadsheet system message and
-advertises `fill_formula.end_row` as an optional integer with its bounds at the
-property level. Callers can omit it. This lets legacy Coder parsers read the type
-without inspecting nullable `anyOf` branches. The converter keeps all other row
+advertises every optional non-string parameter (for example
+`fill_formula.end_row`, `format_range.bold`, `manage_sheet.index`) with its type
+and bounds at the property level. Callers can omit them. This lets legacy Coder
+parsers read the type without inspecting nullable `anyOf` branches; without it
+vLLM's `qwen3_coder` parser passes these values through as strings, which strict
+tool validation rejects. `write_range.data` is advertised as `array` so the
+parser decodes JSON values instead of writing their text into one cell. Datasets
+from the earlier `qwen3_coder_v2` conversion have only `end_row` typed. The converter keeps all other row
 fields and checks both splits against the original manifest before writing a
 separate pair of JSONL files with checksum receipts.
 This step requires only Python on CPU. A rollout smoke must confirm that the

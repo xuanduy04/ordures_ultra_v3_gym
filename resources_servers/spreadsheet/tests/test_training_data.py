@@ -60,6 +60,19 @@ def test_coder_prompt_conversion_preserves_the_qualified_rows(tmp_path):
             "type": "integer", "minimum": 1, "maximum": 1048576, "title": "End Row",
         }
         assert original_properties["end_row"]["default"] is None
+        tools = {tool["name"]: tool["parameters"]["properties"] for tool in converted["responses_create_params"]["tools"]}
+        originals = {tool["name"]: tool["parameters"]["properties"] for tool in original["responses_create_params"]["tools"]}
+        # Every optional non-string scalar needs a top-level type for the Coder parser.
+        assert tools["format_range"]["bold"] == {"type": "boolean", "title": "Bold"}
+        assert tools["format_range"]["row_height"] == {"type": "number", "exclusiveMinimum": 0, "maximum": 409, "title": "Row Height"}
+        assert tools["manage_sheet"]["index"] == {"type": "integer", "minimum": 0, "maximum": 199, "title": "Index"}
+        assert tools["write_range"]["data"] == {"type": "array", "title": "Data"}
+        # Optional strings already arrive as strings and stay unchanged.
+        assert tools["format_range"]["fill_color"] == originals["format_range"]["fill_color"]
+        for name, properties in tools.items():
+            for key, schema in properties.items():
+                assert "type" in schema or [b["type"] for b in schema["anyOf"]] in (["string", "null"],)
+                properties[key] = originals[name][key]
         converted_properties["end_row"] = original_properties["end_row"]
         assert converted == original
         assert receipt["splits"][split]["rows"] == 1

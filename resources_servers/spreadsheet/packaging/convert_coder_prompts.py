@@ -40,18 +40,37 @@ def digest(path):
 
 
 def coder_tool_schema(tool):
-    if tool["name"] != "fill_formula":
-        return tool
+    # vLLM's qwen3_coder parser converts a parameter only by its top-level "type";
+    # without one it returns the raw parameter text. That breaks every optional
+    # non-string scalar (format_range.bold, manage_sheet.index, ...), not only
+    # fill_formula.end_row, and makes write_range.data always a string.
     parameters = tool["parameters"]
     properties = parameters["properties"]
-    end_row = properties["end_row"]
-    branches = {branch["type"]: branch for branch in end_row["anyOf"]}
-    if branches.keys() != {"integer", "null"} or "end_row" in parameters.get("required", []):
-        raise ValueError("Expected an optional nullable integer for fill_formula.end_row")
-    # The legacy Coder parser only reads the property's top-level type.
-    typed_end_row = {key: value for key, value in end_row.items() if key not in ("anyOf", "default")}
-    typed_end_row.update(branches["integer"])
-    return dict(tool, parameters=dict(parameters, properties=dict(properties, end_row=typed_end_row)))
+    required = parameters["required"] if "required" in parameters else []
+    typed = {}
+    for name, schema in properties.items():
+        if "type" in schema:
+            continue
+        if "anyOf" not in schema:
+            if set(schema) - {"title", "description"}:
+                raise ValueError(f"Unexpected untyped schema for {tool['name']}.{name}")
+            # An unconstrained value: "array" makes the parser try JSON first, then
+            # a Python literal, and keep plain text as a string.
+            typed[name] = dict(schema, type="array")
+            continue
+        branches = {branch["type"]: branch for branch in schema["anyOf"]}
+        if len(branches) != 2 or "null" not in branches or name in required:
+            raise ValueError(f"Expected an optional nullable scalar for {tool['name']}.{name}")
+        (kind,) = branches.keys() - {"null"}
+        if kind == "string":
+            continue
+        # The legacy Coder parser only reads the property's top-level type.
+        lifted = {key: value for key, value in schema.items() if key not in ("anyOf", "default")}
+        lifted.update(branches[kind])
+        typed[name] = lifted
+    if not typed:
+        return tool
+    return dict(tool, parameters=dict(parameters, properties=dict(properties, **typed)))
 
 
 def convert_row(row):
@@ -81,7 +100,8 @@ def convert(source_dir, manifest, output_dir):
             raise ValueError("Expected a unique qualified manifest entry for each task")
         qualified[task_id] = entry["dataset_revision"]
     manifest_hash = digest(manifest)
-    receipt = {"prompt_variant": "qwen3_coder_v2", "manifest_sha256": manifest_hash, "splits": {}}
+    # v3: every optional non-string parameter and write_range.data are typed.
+    receipt = {"prompt_variant": "qwen3_coder_v3", "manifest_sha256": manifest_hash, "splits": {}}
     seen = set()
     with tempfile.TemporaryDirectory(prefix=".coder-prompts-", dir=output_dir.parent) as folder:
         stage = Path(folder)
