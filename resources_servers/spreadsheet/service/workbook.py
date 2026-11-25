@@ -1,7 +1,8 @@
 """Bounded workbook operations, independent of Gym and verl.
 
 The API intentionally documents openpyxl structural-edit semantics rather than
-claiming Excel's automatic dependency repair. Recalculation is a separate engine.
+claiming Excel's automatic dependency repair. Recalculation is a separate
+engine.
 """
 
 import math
@@ -11,7 +12,7 @@ from datetime import date, datetime, time
 from pathlib import Path
 from zipfile import BadZipFile, ZipFile
 
-from .errors import ToolError
+from .errors import EnvironmentError, ToolError
 
 
 MAX_CELLS = 100_000
@@ -41,8 +42,31 @@ def load(path: Path, *, values: bool = False, read_only: bool = False):
     check_archive(path)
     try:
         return load_workbook(path, data_only=values, read_only=read_only, keep_links=False)
-    except (ValueError, KeyError, TypeError, OSError) as exc:
+    except ImportError:
+        raise
+    except Exception as exc:
+        # Workbook files are model-controlled. Any parser failure, including XML
+        # syntax errors (SyntaxError subclasses, not ValueError), is a tool error
+        # rather than an engine outage.
         raise ToolError("Workbook cannot be opened") from exc
+
+
+def formula_text(value):
+    """Return the text of a formula cell's value.
+
+    openpyxl represents array formulas as ``ArrayFormula`` (which has ``text``)
+    and data-table formulas as ``DataTableFormula`` (which has none) rather
+    than as strings.
+
+    Args:
+        value: The value of a cell whose ``data_type`` is ``"f"``.
+
+    Returns:
+        The formula text, or the formula's class name when it has no text.
+    """
+    if isinstance(value, str):
+        return value
+    return getattr(value, "text", None) or type(value).__name__
 
 
 def json_value(value):
@@ -50,7 +74,11 @@ def json_value(value):
         return value.isoformat()
     if isinstance(value, float) and not math.isfinite(value):
         return str(value)
-    return value
+    if value is None or isinstance(value, (str, int, float)):
+        return value
+    # openpyxl also returns e.g. timedelta for duration number formats; tool
+    # observations must stay JSON values.
+    return str(value)
 
 
 def split_ranges(text: str, *, max_ranges: int = 20) -> list[str]:
@@ -122,7 +150,7 @@ def records(path: Path, addresses: list[str], sheet_name=None, *, summary=False,
                         item = {
                             "address": cell.coordinate,
                             "value": json_value(values[cell.coordinate].value),
-                            "formula": cell.value if cell.data_type == "f" else None,
+                            "formula": formula_text(cell.value) if cell.data_type == "f" else None,
                         }
                         if details:
                             item.update(
@@ -166,6 +194,7 @@ def execute(path: Path, name: str, args: dict):
     from openpyxl.formula.translate import Translator, TranslatorError
     from openpyxl.styles import PatternFill, Side
     from openpyxl.utils.cell import column_index_from_string, get_column_letter
+    from openpyxl.utils.exceptions import CellCoordinatesException, IllegalCharacterError
 
     if name == "inspect_range":
         return records(
@@ -208,7 +237,7 @@ def execute(path: Path, name: str, args: dict):
                             if args["search_in"] in ("values", "both"):
                                 candidates.append(cached[ws.title][cell.coordinate].value)
                             if args["search_in"] in ("formulas", "both") and cell.data_type == "f":
-                                candidates.append(cell.value)
+                                candidates.append(formula_text(cell.value))
                             texts = [
                                 str(v) if args["case_sensitive"] else str(v).casefold()
                                 for v in candidates
@@ -223,7 +252,10 @@ def execute(path: Path, name: str, args: dict):
                             if matched:
                                 record = {"sheet_name": ws.title, "address": cell.coordinate}
                                 if args["include_values"]:
-                                    record["value"] = json_value(cell.value)
+                                    # cell comes from the formula workbook; report its cached
+                                    # value as inspect_range does, with the formula beside it.
+                                    record["value"] = json_value(cached[ws.title][cell.coordinate].value)
+                                    record["formula"] = formula_text(cell.value) if cell.data_type == "f" else None
                                 matches.append(record)
                                 if args["return"] == "first" or len(matches) >= args["max_results"]:
                                     return {"matches": matches, "limit_reached": True}
@@ -394,8 +426,24 @@ def execute(path: Path, name: str, args: dict):
                 "changed_range": f"{get_column_letter(left)}{top}:{get_column_letter(right)}{bottom}",
             }
         wb.save(path)
+        # openpyxl writes some model-supplied strings (sheet titles, number formats)
+        # into XML without validating them; never report success for a workbook
+        # that cannot be reopened. The caller discards the staged copy on ToolError.
+        load(path, read_only=True).close()
         return result
-    except (KeyError, ValueError, TypeError, IndexError, AttributeError, TokenizerError, TranslatorError) as exc:
+    # openpyxl's own exceptions (e.g. IllegalCharacterError for control characters
+    # in a written string) derive from Exception, not ValueError.
+    except (
+        KeyError,
+        ValueError,
+        TypeError,
+        IndexError,
+        AttributeError,
+        TokenizerError,
+        TranslatorError,
+        CellCoordinatesException,
+        IllegalCharacterError,
+    ) as exc:
         if isinstance(exc, ToolError):
             raise
         raise ToolError(str(exc)[:300]) from exc
@@ -471,12 +519,22 @@ def cell_equal(a, b, expected_epoch=None, produced_epoch=None):
 def compare(oracle: Path, actual: Path, answer_position: str):
     from .answer_metadata import _resolve_sheet_name
 
-    expected = load(oracle, values=True, read_only=True)
+    # The oracle and answer metadata are server-owned task data. A defect in them
+    # is an environment error: a verify tool error, which the Gym adapter scores
+    # as zero, must mean the policy's own workbook could not be scored.
+    try:
+        expected = load(oracle, values=True, read_only=True)
+    except ToolError as exc:
+        raise EnvironmentError("Task oracle cannot be opened") from exc
     produced = None
     matched = total = 0
     try:
+        try:
+            regions = answer_regions(expected, answer_position)
+        except ToolError as exc:
+            raise EnvironmentError(f"Task answer metadata is invalid: {exc}") from exc
         produced = load(actual, values=True, read_only=True)
-        for ws, (left, top, right, bottom) in answer_regions(expected, answer_position):
+        for ws, (left, top, right, bottom) in regions:
             width = right - left + 1
             total += width * (bottom - top + 1)
             actual_title = _resolve_sheet_name(produced, ws.title)
@@ -507,7 +565,7 @@ def compare(oracle: Path, actual: Path, answer_position: str):
                         )
                     )
         if not total:
-            raise ToolError("No answer cells in task metadata")
+            raise EnvironmentError("No answer cells in task metadata")
         return {
             "reward": float(matched == total),
             "matched_cells": matched,

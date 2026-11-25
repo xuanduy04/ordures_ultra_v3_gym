@@ -1,7 +1,8 @@
 """Spreadsheet orchestration with stable per-function-call operation IDs.
 
-The Responses loop follows simple_agent so training token IDs/logprobs and usage
-remain attached to their original model outputs. Keep it aligned with that agent.
+The Responses loop follows simple_agent so training token IDs/logprobs and
+usage remain attached to their original model outputs. Keep it aligned with
+that agent.
 """
 
 import asyncio
@@ -12,6 +13,7 @@ import time
 from typing import List
 from uuid import uuid4
 
+import orjson
 from fastapi import HTTPException, Request, Response
 from pydantic import Field, PrivateAttr, ValidationError
 
@@ -168,7 +170,7 @@ class SpreadsheetAgent(SimpleAgent):
             if not all_fn_calls and all_output_messages:
                 break
 
-            for output_function_call in all_fn_calls:
+            for index, output_function_call in enumerate(all_fn_calls):
                 if output_function_call.name not in TOOL_MODELS:
                     new_outputs.append(
                         NeMoGymFunctionCallOutput(
@@ -180,7 +182,11 @@ class SpreadsheetAgent(SimpleAgent):
                     continue
                 try:
                     parsed_arguments = json.loads(output_function_call.arguments)
-                except (json.JSONDecodeError, TypeError) as e:
+                    # Gym's HTTP client encodes with orjson, which rejects values that
+                    # json.loads accepts (lone surrogates, integers beyond 64 bits).
+                    # Check here so they become tool errors, not a failed rollout.
+                    orjson.dumps(parsed_arguments)
+                except (json.JSONDecodeError, TypeError, RecursionError) as e:
                     # Model produced malformed tool-call arguments. Surface the
                     # error back as a tool response so the rollout can continue
                     # (or terminate with a low reward) instead of crashing the
@@ -200,7 +206,11 @@ class SpreadsheetAgent(SimpleAgent):
                     url_path=f"/{output_function_call.name}",
                     json=parsed_arguments,
                     cookies=resources_server_cookies,
-                    headers={"X-Spreadsheet-Operation-Id": output_function_call.call_id},
+                    # Provider call IDs need not be unique within a rollout (e.g.
+                    # per-turn "functions.<name>:<n>" IDs), and the service replays a
+                    # stored receipt for a repeated ID. The turn and position make it
+                    # unique while staying stable across HTTP retries of this call.
+                    headers={"X-Spreadsheet-Operation-Id": f"{step}.{index}.{output_function_call.call_id}"[:256]},
                 )
                 # We don't raise for status here since it's a valid return for the API to error e.g. if the model outputs an invalid call or something.
                 if api_response.status >= 500:

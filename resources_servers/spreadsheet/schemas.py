@@ -1,8 +1,31 @@
 """Shared tool contracts. This module has no Gym or spreadsheet-engine dependency."""
 
+import json
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
+
+
+MAX_ARGUMENT_BYTES = 128 * 1024
+
+
+def encode_arguments(arguments: dict) -> str:
+    """Encode tool arguments canonically for idempotency and the size limit.
+
+    Both the Gym adapter and the service measure ``MAX_ARGUMENT_BYTES`` against
+    this encoding, so an oversized model call is rejected as a tool error
+    before it can reach the service's HTTP body limit.
+
+    Args:
+        arguments: Decoded tool-call arguments.
+
+    Returns:
+        Canonical JSON text with non-ASCII characters escaped.
+
+    Raises:
+        ValueError: If the arguments contain non-finite numbers.
+    """
+    return json.dumps(arguments, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
 class WorkbookRequest(BaseModel):

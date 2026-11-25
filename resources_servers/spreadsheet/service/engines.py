@@ -83,8 +83,17 @@ class LibreOfficePool:
 
     def recalculate(self, path: Path):
         from .ooxml_metadata import capture, restore
+        from .workbook import load
 
-        metadata = capture(path)
+        # Every recalculated workbook is model-produced (or an oracle copy during
+        # qualification), so failures that concern its content are tool errors:
+        # the staged copy is discarded, and verify scores it zero instead of
+        # aborting training. Capacity and worker-startup failures stay
+        # environment errors.
+        try:
+            metadata = capture(path)
+        except Exception as exc:
+            raise ToolError("Workbook package XML cannot be parsed; changes discarded") from exc
         try:
             slot = self.slots.get(timeout=self.timeout)
         except queue.Empty:
@@ -93,18 +102,35 @@ class LibreOfficePool:
         try:
             deadline = time.monotonic() + self.timeout
             process = self._get_process(slot, deadline)
+            # The worker is ready, so the document budget excludes startup time. The
+            # worker is still restarted below after a document failure, so a
+            # LibreOffice instance that broke on this workbook cannot fail later ones.
+            deadline = time.monotonic() + self.timeout
             process.stdin.write(json.dumps({"path": str(path.resolve())}) + "\n")
             process.stdin.flush()
-            self._read(process, deadline)
-            return {"metadata_repairs": restore(path, metadata)}
+            try:
+                self._read(process, deadline)
+            except EnvironmentError as exc:
+                raise ToolError(f"{exc}; changes discarded") from exc
         except Exception as exc:
             terminate(process or self.processes.get(slot))
             self.processes.pop(slot, None)
-            if isinstance(exc, EnvironmentError):
+            if isinstance(exc, (EnvironmentError, ToolError)):
                 raise
             raise EnvironmentError("LibreOffice worker unavailable") from exc
         finally:
             self.slots.put(slot)
+        try:
+            repairs = restore(path, metadata)
+            # LibreOffice can export workbook-level parts that openpyxl cannot read.
+            load(path, read_only=True).close()
+        except ToolError:
+            raise
+        except ImportError:
+            raise EnvironmentError("Workbook runtime dependency is unavailable") from None
+        except Exception as exc:
+            raise ToolError("LibreOffice exported an unreadable workbook; changes discarded") from exc
+        return {"metadata_repairs": repairs}
 
     def probe(self):
         slot = self.slots.get(timeout=self.timeout)
@@ -224,7 +250,11 @@ class BubblewrapPython:
                     if len(output) > self.output_bytes:
                         terminate(process)
                         raise ToolError("Python output limit exceeded; workbook changes were discarded")
-            process.wait(timeout=max(1, deadline - time.monotonic()))
+            try:
+                process.wait(timeout=max(1, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                # The program closed its output early and kept running.
+                raise ToolError("Python execution timed out; workbook changes were discarded") from None
             text = output.decode("utf-8", errors="replace")
             if process.returncode:
                 if text.startswith("bwrap:"):

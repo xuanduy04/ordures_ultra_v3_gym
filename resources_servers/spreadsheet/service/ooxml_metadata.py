@@ -1,7 +1,8 @@
 """Preserve valid input metadata when a calculation-only LO export corrupts it.
 
-Only filters, validation rules and merge ranges are eligible. A malformed input,
-changed table topology, pivot caches and chart data are never guessed or erased.
+Only filters, validation rules and merge ranges are eligible. A malformed
+input, changed table topology, pivot caches and chart data are never guessed or
+erased.
 No worksheet cells, formulas, cached values or styles are patched.
 """
 
@@ -43,11 +44,11 @@ def valid(element):
         "mergeCells": MergeCells,
     }
     try:
-        classes[element.tag.removeprefix(NS)].from_tree(
-            fromstring(ET.tostring(element))
-        )
+        classes[element.tag.removeprefix(NS)].from_tree(fromstring(ET.tostring(element)))
         return True
-    except (ValueError, TypeError, KeyError):
+    # Any parser failure means "not schema-valid"; an exception escaping here
+    # would abort the recalculation instead of skipping this element.
+    except Exception:
         return False
 
 
@@ -60,9 +61,7 @@ def capture(path):
             result["sheets"][title] = {
                 element.tag: deepcopy(element)
                 for element in root
-                if element.tag
-                in {NS + "autoFilter", NS + "dataValidations", NS + "mergeCells"}
-                and valid(element)
+                if element.tag in {NS + "autoFilter", NS + "dataValidations", NS + "mergeCells"} and valid(element)
             }
         for part in archive.namelist():
             if part.startswith("xl/tables/") and part.endswith(".xml"):
@@ -122,16 +121,12 @@ def restore(path, before):
                 element = tree.find(NS + "autoFilter")
                 saved = before["tables"].get(key)
                 if element is not None and saved is not None and not valid(element):
-                    replacements[part] = replace_subtrees(
-                        content, {NS + "autoFilter": saved}
-                    )
+                    replacements[part] = replace_subtrees(content, {NS + "autoFilter": saved})
                     repairs.append({"part": part, "kind": "tableAutoFilter"})
         if replacements:
             buffer = io.BytesIO()
             with ZipFile(buffer, "w") as target:
                 for entry in archive.infolist():
-                    target.writestr(
-                        entry, replacements.get(entry.filename, archive.read(entry))
-                    )
+                    target.writestr(entry, replacements.get(entry.filename, archive.read(entry)))
             path.write_bytes(buffer.getvalue())
     return repairs

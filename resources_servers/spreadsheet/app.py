@@ -1,6 +1,7 @@
 """Lightweight NeMo Gym adapter to a separately deployed spreadsheet service."""
 
 import asyncio
+from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import ConfigDict, Field, SecretStr
@@ -16,7 +17,11 @@ from nemo_gym.base_resources_server import (
 )
 from nemo_gym.server_utils import get_response_json
 from nemo_gym.server_utils import request as gym_request
-from resources_servers.spreadsheet.schemas import TOOL_MODELS
+from resources_servers.spreadsheet.schemas import MAX_ARGUMENT_BYTES, TOOL_MODELS, encode_arguments
+
+
+class ToolRejection(Exception):
+    """A service rejection caused by the model's own tool call, not by the environment."""
 
 
 class SpreadsheetConfig(BaseResourcesServerConfig):
@@ -40,8 +45,9 @@ class SpreadsheetVerifyRequest(BaseVerifyRequest):
 class SpreadsheetVerifyResponse(BaseVerifyResponse):
     model_config = ConfigDict(extra="allow")
     cell_accuracy: float
-    engine: str
-    workbook_sha256: str
+    # None when the policy's final workbook could not be scored (reward 0).
+    engine: str | None
+    workbook_sha256: str | None
 
 
 class SpreadsheetResourcesServer(SimpleResourcesServer):
@@ -63,6 +69,10 @@ class SpreadsheetResourcesServer(SimpleResourcesServer):
         )
         try:
             result = await get_response_json(response)
+            if response.status == 400 and isinstance(result, dict) and result.get("error_type") == "tool_error":
+                # The service rejected the model's own call before queueing it:
+                # that is an observation for the model, not an outage.
+                raise ToolRejection(str(result["detail"]))
             if response.status >= 400:
                 # Do not include remote URLs, credentials, or filesystem paths.
                 raise HTTPException(
@@ -82,8 +92,16 @@ class SpreadsheetResourcesServer(SimpleResourcesServer):
         request.session["spreadsheet_session"] = session
         return session
 
-    async def _operation(self, request, operation_id, action, arguments):
+    async def _operation(self, request, operation_id, action, arguments) -> dict[str, Any]:
         session = self._session(request)
+        try:
+            encoded = encode_arguments(arguments)
+        except ValueError:
+            return {"ok": False, "error_type": "tool_error", "error": "Tool arguments must be finite JSON values"}
+        if len(encoded) > MAX_ARGUMENT_BYTES:
+            # Mirrors the service's own limit so an oversized model call never hits
+            # its HTTP body limit, which would surface as an environment failure.
+            return {"ok": False, "error_type": "tool_error", "error": "Tool arguments exceed the size limit"}
         try:
             async with asyncio.timeout(self.config.operation_timeout):
                 job = await self._call(
@@ -102,6 +120,8 @@ class SpreadsheetResourcesServer(SimpleResourcesServer):
                 if result.get("error_type") == "environment_error":
                     raise HTTPException(503, result)
                 return result
+        except ToolRejection as exc:
+            return {"ok": False, "error_type": "tool_error", "error": str(exc)}
         except TimeoutError:
             raise HTTPException(
                 503, {"error_type": "environment_error", "error": "Spreadsheet operation deadline exceeded"}
@@ -148,8 +168,13 @@ class SpreadsheetResourcesServer(SimpleResourcesServer):
             raise HTTPException(409, "Verifier task does not match the seeded session")
         result = await self._operation(request, "verify", "verify", {})
         if not result.get("ok"):
-            raise HTTPException(
-                503, {"error_type": "environment_error", "error": "Verifier could not score the workbook"}
+            # _operation already raised for environment failures. What remains is a
+            # workbook the policy left unreadable or unrecalculable: score it zero
+            # instead of aborting the whole training step.
+            return SpreadsheetVerifyResponse(
+                **(body.model_dump() | {"reward": 0.0, "cell_accuracy": 0.0, "verify_error": result["error"]}),
+                engine=None,
+                workbook_sha256=None,
             )
         return SpreadsheetVerifyResponse(
             **(body.model_dump() | result["output"]),

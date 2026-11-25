@@ -8,7 +8,7 @@ import pytest
 
 openpyxl = pytest.importorskip("openpyxl")
 
-from resources_servers.spreadsheet.service.errors import ToolError  # noqa: E402
+from resources_servers.spreadsheet.service.errors import EnvironmentError, ToolError  # noqa: E402
 from resources_servers.spreadsheet.service.workbook import (  # noqa: E402
     cell_equal,
     compare,
@@ -90,5 +90,7 @@ def test_streaming_reader_scores_trailing_empty_cells_and_missing_sheets(tmp_pat
 def test_metadata_budget_stays_bounded(tmp_path):
     path = workbook(tmp_path / "oracle.xlsx")
     address = ",".join(["Result!A1:A100000"] * 21)
-    with pytest.raises(ToolError, match="total answer cells"):
+    # Answer metadata is task data: a defect is an environment error, never a
+    # tool error that verify would score as zero.
+    with pytest.raises(EnvironmentError, match="total answer cells"):
         compare(path, path, address)

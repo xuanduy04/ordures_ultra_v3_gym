@@ -142,7 +142,12 @@ def create_app(config: ServiceConfig, *, store=None):
     async def sweep():
         while True:
             await asyncio.sleep(min(60, config.session_ttl_seconds))
-            await asyncio.to_thread(store.cleanup, config.session_ttl_seconds)
+            # One failed pass (e.g. a locked database) must not end the sweep task
+            # for the rest of the service's life; expired workspaces would pile up.
+            try:
+                await asyncio.to_thread(store.cleanup, config.session_ttl_seconds)
+            except Exception as exc:
+                print(json.dumps({"event": "SESSION_CLEANUP_FAILED", "error": type(exc).__name__}), flush=True)
 
     @asynccontextmanager
     async def lifespan(app):

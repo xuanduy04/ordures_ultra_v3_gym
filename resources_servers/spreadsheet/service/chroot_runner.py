@@ -94,18 +94,31 @@ class ChrootPython:
                     output.extend(chunk)
                     if len(output) > self.output_bytes:
                         raise ToolError("Python output limit exceeded; changes discarded")
-            process.wait(timeout=max(1, deadline - time.monotonic()))
+            try:
+                process.wait(timeout=max(1, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                # The program closed its output early and kept running.
+                raise ToolError("Python execution timed out; changes discarded") from None
             text = output.decode(errors="replace")
             # Kill descendants even when their parent exited successfully. The
             # seccomp policy forbids escaping this process group with setsid/setpgid.
             terminate(process)
-            if process.returncode == 125:
+            # Model code can exit with 125 itself; only the bootstrap's marker means
+            # the host rejected the isolation setup.
+            if process.returncode == 125 and text.startswith("SPREADSHEET_ISOLATION_SETUP_FAILED"):
                 raise EnvironmentError("Host rejected chroot/UID/seccomp setup; no unsafe fallback")
             if process.returncode:
                 raise ToolError(text[-4000:] or "Python execution failed")
             candidate = jail / "data.xlsx"
-            if candidate.exists() or candidate.is_symlink():
-                descriptor = os.open(candidate, os.O_RDONLY | os.O_NOFOLLOW)
+            if candidate.is_symlink():
+                raise ToolError("Python produced an invalid workbook file")
+            if candidate.exists():
+                # O_NONBLOCK: a FIFO named data.xlsx must not block this job forever;
+                # it then fails the regular-file check below.
+                try:
+                    descriptor = os.open(candidate, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                except OSError:
+                    raise ToolError("Python produced an invalid workbook file") from None
                 with os.fdopen(descriptor, "rb") as stream:
                     info = os.fstat(stream.fileno())
                     if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 100 * 1024**2:

@@ -35,6 +35,8 @@ spreadsheet service.
    correctness over server-owned answer regions; cell accuracy is diagnostic only.
 9. Bad model arguments/invalid edits are tool errors. Infrastructure/engine failure
    is an environment error and must not silently become reward zero.
+   A model-produced workbook that LibreOffice cannot open or recalculate within
+   its deadline is an invalid edit; at verify it scores zero.
 10. Python executes only through an OS isolation backend. This target denies user
     namespaces but grants chroot/setuid/setgid capabilities. Default: a minimal
     Python chroot, different unprivileged UIDs per active job, no-new-privileges,

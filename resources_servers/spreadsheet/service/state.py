@@ -17,7 +17,13 @@ from uuid import uuid4
 
 from pydantic import ValidationError
 
-from resources_servers.spreadsheet.schemas import READ_ONLY, RECALCULATE_ON_WRITE, TOOL_MODELS
+from resources_servers.spreadsheet.schemas import (
+    MAX_ARGUMENT_BYTES,
+    READ_ONLY,
+    RECALCULATE_ON_WRITE,
+    TOOL_MODELS,
+    encode_arguments,
+)
 
 from . import workbook
 from .catalog import sha256_file
@@ -44,7 +50,11 @@ class Store:
                     UNIQUE(session_id, operation_id));
                 CREATE TABLE IF NOT EXISTS executions (
                     session_id TEXT PRIMARY KEY, execution_id TEXT NOT NULL);
+                CREATE INDEX IF NOT EXISTS jobs_status ON jobs (status);
             """)
+            # Every submit counts pending jobs while holding the write lock, and job
+            # receipts are retained for the session TTL; without the index above that
+            # count scans every retained job.
 
     @contextmanager
     def db(self):
@@ -128,8 +138,11 @@ class Store:
             raise ValueError("A bounded operation_id is required")
         if action not in TOOL_MODELS and action != "verify":
             raise ToolError("Unknown tool")
-        payload = json.dumps(arguments, sort_keys=True, separators=(",", ":"), allow_nan=False)
-        if len(payload) > 128 * 1024:
+        try:
+            payload = encode_arguments(arguments)
+        except ValueError:
+            raise ToolError("Tool arguments must be finite JSON values") from None
+        if len(payload) > MAX_ARGUMENT_BYTES:
             raise ToolError("Tool arguments exceed the size limit")
         with self.db() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -192,8 +205,21 @@ class Store:
                     "error_type": "environment_error",
                     "error": "Execution backend failed; this is not an incorrect-answer reward",
                 }
+            # Serialization runs outside the handlers above, and an exception here
+            # would leave the job RUNNING until the caller's deadline. Unknown cell
+            # types become strings; strict JSON keeps NaN out of stored receipts.
+            try:
+                encoded = json.dumps(result, default=str, allow_nan=False)
+            except (TypeError, ValueError):
+                encoded = json.dumps(
+                    {
+                        "ok": False,
+                        "error_type": "environment_error",
+                        "error": "Tool output could not be serialized",
+                    }
+                )
             with self.db() as db:
-                db.execute("UPDATE jobs SET status='DONE', result=? WHERE id=?", (json.dumps(result), job_id))
+                db.execute("UPDATE jobs SET status='DONE', result=? WHERE id=?", (encoded, job_id))
                 db.execute("UPDATE sessions SET updated=? WHERE id=?", (time.time(), row["session_id"]))
 
     def _execute(self, session, action, arguments, job_id):

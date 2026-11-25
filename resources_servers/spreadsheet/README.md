@@ -129,9 +129,10 @@ updates. `format_range` supports a single common border style on all sides.
   of the same task use different sessions. Sources and oracle files stay untouched.
 - Native and Python mutations run on staging copies. Only successful, valid XLSX
   outputs atomically replace the canonical workbook. No hard links are used.
-- Operation IDs are the provider's `call_id`, outside model arguments. Repeating
-  the same ID/input returns the persisted receipt; changing input is a conflict.
-  Identical calls with new IDs really execute again.
+- Operation IDs are `<turn>.<position>.<call_id>`, built by the agent outside
+  model arguments, so they stay unique even when a provider reuses `call_id`
+  values across turns. Repeating the same ID/input returns the persisted receipt;
+  changing input is a conflict. Identical calls with new IDs really execute again.
 - A session's operations are serialized with a filesystem lock. SQLite stores
   job/results so a lost HTTP response can be polled/retried. After a service crash,
   interrupted writes are marked indeterminate, not replayed.
@@ -378,6 +379,15 @@ Malformed model arguments and failed edits return tool observations. Queue,
 engine, isolation, and I/O failures are environment errors (HTTP 503 / failed
 rollout), never silently zero rewards. Configure the trainer to retry/drop failed
 episodes rather than treating infrastructure failures as policy mistakes.
+
+Content-caused failures count as failed edits, not engine failures: arguments
+over the 128 KiB escaped-JSON limit, values Gym's HTTP client cannot encode, and
+a model-produced workbook that LibreOffice cannot open or recalculate within its
+deadline (measured after the worker is ready), or that openpyxl cannot reopen.
+The edit is discarded and the worker restarted. If the final workbook cannot be
+scored, verify returns reward 0 with `verify_error` instead of failing the
+rollout. An unreadable oracle or invalid answer metadata stays an environment
+error. NeMo RL re-raises any failed rollout, which stops training.
 
 LibreOffice workers have separate profiles, one workbook at a time, a hard
 deadline, and worker replacement after failure. Macros and external-link updates

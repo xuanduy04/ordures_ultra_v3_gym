@@ -87,7 +87,7 @@ async def test_agent_propagates_call_id_cookies_and_training_tokens():
     )
     result = await server._responses_once(request(), Response(), NeMoGymResponseCreateParamsNonStreaming(input=[]))
     calls = server.server_client.post.call_args_list
-    assert calls[1].kwargs["headers"] == {"X-Spreadsheet-Operation-Id": "provider-call-42"}
+    assert calls[1].kwargs["headers"] == {"X-Spreadsheet-Operation-Id": "1.0.provider-call-42"}
     assert calls[1].kwargs["cookies"]["spreadsheet_test"] == "signed-session-cookie"
     assert result.output[0].model_dump()["generation_token_ids"] == [3, 4]
     assert calls[2].kwargs["json"].input[0].model_dump()["generation_log_probs"] == [-0.1, -0.2]
@@ -243,7 +243,7 @@ async def test_multiple_tool_turns_keep_cookies_when_a_response_has_no_set_cooki
     await server._responses_once(request(), Response(), NeMoGymResponseCreateParamsNonStreaming(input=[]))
     calls = server.server_client.post.call_args_list
     assert calls[3].kwargs["cookies"]["spreadsheet_test"] == "signed-session-cookie"
-    assert calls[3].kwargs["headers"]["X-Spreadsheet-Operation-Id"] == "read-2"
+    assert calls[3].kwargs["headers"]["X-Spreadsheet-Operation-Id"] == "2.0.read-2"
 
 
 def test_adapter_refreshes_cookie_on_read_only_tool(monkeypatch):
@@ -274,3 +274,129 @@ def test_adapter_refreshes_cookie_on_read_only_tool(monkeypatch):
     response = client.post("/list_sheets", json={}, headers={"X-Spreadsheet-Operation-Id": "read"})
     assert response.status_code == 200
     assert "spreadsheet_test" in response.cookies
+
+
+def adapter(monkeypatch, backend):
+    from fastapi.testclient import TestClient
+
+    from resources_servers.spreadsheet.app import SpreadsheetConfig, SpreadsheetResourcesServer
+
+    config = SpreadsheetConfig(
+        host="127.0.0.1",
+        port=8003,
+        entrypoint="app.py",
+        name="test",
+        service_url="http://service:8088",
+        api_key="x" * 40,
+        session_secret_key="y" * 40,
+    )
+    server = SpreadsheetResourcesServer(config=config, server_client=MagicMock(spec=ServerClient))
+    monkeypatch.setattr(SpreadsheetResourcesServer, "_call", backend)
+    client = TestClient(server.setup_webserver())
+    assert client.post("/seed_session", json={"task_id": "task", "rollout_id": "rollout"}).status_code == 200
+    return client
+
+
+def test_oversized_model_arguments_are_a_tool_observation_not_an_outage(monkeypatch):
+    backend = AsyncMock(side_effect=[{"session_id": "a" * 32}])
+    client = adapter(monkeypatch, backend)
+    # 25k Vietnamese characters is within the 65,536-character schema limit but
+    # exceeds the service's escaped-JSON argument limit.
+    response = client.post(
+        "/code_interpreter", json={"code": "# " + "ệ" * 25_000}, headers={"X-Spreadsheet-Operation-Id": "c"}
+    )
+    assert response.status_code == 200
+    assert response.json() == {"ok": False, "error_type": "tool_error", "error": "Tool arguments exceed the size limit"}
+    assert backend.await_count == 1
+
+
+def test_service_tool_rejection_is_returned_to_the_model(monkeypatch):
+    from resources_servers.spreadsheet import app as adapter_module
+    from resources_servers.spreadsheet.app import SpreadsheetConfig, SpreadsheetResourcesServer
+
+    def http(status, value):
+        return SimpleNamespace(status=status, read=AsyncMock(return_value=json.dumps(value).encode()), release=MagicMock())
+
+    async def fake_request(method, url, **kwargs):
+        if url.endswith("/sessions"):
+            return http(200, {"session_id": "a" * 32})
+        return http(400, {"detail": "Unknown tool", "error_type": "tool_error"})
+
+    monkeypatch.setattr(adapter_module, "gym_request", fake_request)
+    from fastapi.testclient import TestClient
+
+    config = SpreadsheetConfig(
+        host="127.0.0.1",
+        port=8003,
+        entrypoint="app.py",
+        name="test",
+        service_url="http://service:8088",
+        api_key="x" * 40,
+        session_secret_key="y" * 40,
+    )
+    server = SpreadsheetResourcesServer(config=config, server_client=MagicMock(spec=ServerClient))
+    client = TestClient(server.setup_webserver())
+    assert client.post("/seed_session", json={"task_id": "task", "rollout_id": "rollout"}).status_code == 200
+    response = client.post("/list_sheets", json={}, headers={"X-Spreadsheet-Operation-Id": "c"})
+    assert response.status_code == 200
+    assert response.json() == {"ok": False, "error_type": "tool_error", "error": "Unknown tool"}
+
+
+def verify_body():
+    return {
+        "task_id": "task",
+        "responses_create_params": {"input": []},
+        "response": model_response([final_message()]),
+    }
+
+
+def test_unscorable_final_workbook_scores_zero(monkeypatch):
+    failed = {"ok": False, "error_type": "tool_error", "error": "LibreOffice worker timed out; changes discarded"}
+    backend = AsyncMock(side_effect=[{"session_id": "a" * 32}, {"job_id": "j", "status": "DONE", "result": failed}])
+    client = adapter(monkeypatch, backend)
+    response = client.post("/verify", json=verify_body())
+    assert response.status_code == 200
+    result = response.json()
+    assert result["reward"] == 0.0 and result["cell_accuracy"] == 0.0
+    assert result["engine"] is None and result["verify_error"] == failed["error"]
+
+
+def test_environment_failure_during_verify_still_aborts(monkeypatch):
+    failed = {"ok": False, "error_type": "environment_error", "error": "Execution backend failed"}
+    backend = AsyncMock(side_effect=[{"session_id": "a" * 32}, {"job_id": "j", "status": "DONE", "result": failed}])
+    client = adapter(monkeypatch, backend)
+    assert client.post("/verify", json=verify_body()).status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_unencodable_model_arguments_are_tool_errors_not_failed_rollouts():
+    server = agent()
+    calls = [
+        {"type": "function_call", "name": "write_range", "call_id": "s", "arguments": '{"range":"A1","data":"\\ud800"}'},
+        {"type": "function_call", "name": "write_range", "call_id": "b", "arguments": '{"range":"A1","data":1' + "0" * 30 + "}"},
+    ]
+    server.server_client.post = AsyncMock(
+        side_effect=[reply(model_response(calls)), reply(model_response([final_message()]))]
+    )
+    result = await server._responses_once(request(), Response(), NeMoGymResponseCreateParamsNonStreaming(input=[]))
+    assert all(c.kwargs["server_name"] == "policy" for c in server.server_client.post.call_args_list)
+    assert all("Invalid tool call arguments" in item.output for item in result.output[2:4])
+
+
+@pytest.mark.asyncio
+async def test_repeated_provider_call_ids_get_distinct_operation_ids():
+    server = agent()
+    # Per-turn provider IDs, as produced by e.g. kimi_k2-style tool parsers.
+    repeated = {"type": "function_call", "name": "list_sheets", "call_id": "functions.list_sheets:0", "arguments": "{}"}
+    server.server_client.post = AsyncMock(
+        side_effect=[
+            reply(model_response([repeated])),
+            reply({"sheets": []}),
+            reply(model_response([repeated])),
+            reply({"sheets": []}),
+            reply(model_response([final_message()])),
+        ]
+    )
+    await server._responses_once(request(), Response(), NeMoGymResponseCreateParamsNonStreaming(input=[]))
+    headers = [c.kwargs["headers"]["X-Spreadsheet-Operation-Id"] for c in server.server_client.post.call_args_list if "headers" in c.kwargs]
+    assert headers == ["1.0.functions.list_sheets:0", "2.0.functions.list_sheets:0"]
