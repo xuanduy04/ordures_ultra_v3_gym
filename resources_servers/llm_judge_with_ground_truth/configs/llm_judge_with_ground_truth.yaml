@@ -1,0 +1,65 @@
+# ============================================================================
+# LLM Judge With Ground Truth Environment Configuration
+# ============================================================================
+# The LLM judge is NOT managed by NeMo-Gym. The YAML MUST supply:
+#   - llm_judge_server_url : host:port of an already-running chat-completions
+#                            endpoint (e.g. 0.0.0.0:8000). No default is provided.
+#   - llm_judge_model      : model name served at llm_judge_server_url.
+#
+# The judge is a plain chat model, sent a system prompt and a user prompt.
+# Both prompts live in app.py and cannot be changed from this YAML.
+#
+# Each sample MUST carry `question` (the user prompt shown to the judge) and
+# `ground_truth` fields.
+#
+# preference : judged in both answer orders; each verdict scores 1 (ground truth
+#              preferred), 2 (neither) or 3 (policy's answer preferred); summed (2-6)
+# helpfulness: 1 to 5
+#
+# reward = preference + helpfulness (range [3, 11])
+# ============================================================================
+
+llm_judge_with_ground_truth_resources_server:
+  resources_servers:
+    llm_judge_with_ground_truth:
+      entrypoint: app.py
+
+      # MANDATED: externally-hosted LLM judge endpoint (no default).
+      llm_judge_server_url: ""
+      # MANDATED: model name served at llm_judge_server_url (no default).
+      llm_judge_model: ""
+
+      # Generation params for judge calls
+      llm_judge_responses_create_params:
+        input: []
+        max_output_tokens: 65536
+        temperature: 0.6
+        top_p: 0.95
+
+      # Max simultaneous in-flight judge HTTP requests from this server process.
+      # 0 or negative = unlimited.
+      llm_judge_endpoint_max_concurrency: 512
+
+      # Extra judge calls when a reply has no valid [[...]] verdict or rating.
+      llm_judge_parse_retries: 3
+
+      # Server metadata
+      domain: rlhf
+      verified: false
+      description: LLM-judge comparison of the policy answer against a ground-truth answer, plus a helpfulness rating
+      value: Reward helpful answers that are preferred over the ground truth
+
+llm_judge_with_ground_truth_simple_agent:
+  responses_api_agents:
+    simple_agent:
+      entrypoint: app.py
+      resources_server:
+        type: resources_servers
+        name: llm_judge_with_ground_truth_resources_server
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      datasets:
+      - name: example
+        type: example
+        jsonl_fpath: resources_servers/llm_judge_with_ground_truth/data/example.jsonl
