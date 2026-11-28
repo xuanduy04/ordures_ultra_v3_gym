@@ -19,7 +19,7 @@
 # reward = preference + helpfulness (range [3, 11])
 # ============================================================================
 
-llm_judge_with_ground_truth_resources_server:
+llm_judge_with_ground_truth:
   resources_servers:
     llm_judge_with_ground_truth:
       entrypoint: app.py
@@ -55,7 +55,7 @@ llm_judge_with_ground_truth_simple_agent:
       entrypoint: app.py
       resources_server:
         type: resources_servers
-        name: llm_judge_with_ground_truth_resources_server
+        name: llm_judge_with_ground_truth
       model_server:
         type: responses_api_models
         name: policy_model
